@@ -53,11 +53,19 @@ DeepSeek Harness Web GUI 的「版本更新」设置菜单：在设置面板左�
 
 ## 安装
 
+从 npm 安装（推荐，免构建授权）：
+
 ```sh
-dsh plugin --profile web add link:D:\code\dsh_app\dsh-version-update
+dsh plugin --profile web add dsh-version-update
 ```
 
-重启 `dsh web` 后菜单出现。
+或从源码安装：
+
+```sh
+dsh plugin --profile web add github:SuCriss/dsh-version-update
+```
+
+重启 `dsh web` 后菜单出现（host 半区需要重启才会挂载路由）。
 
 ## 配置
 
@@ -66,6 +74,14 @@ dsh plugin --profile web add link:D:\code\dsh_app\dsh-version-update
 - `announceToAgent`（默认 true）— 是否向 agent 注入本插件的说明段落。
 - `registry`（默认 `https://registry.npmjs.org`）— 读取版本信息的 registry 基地址。
 - `allowRestart`（默认 true）— 置为 false 则不提供重启路由，页面只提示需要手动重启。
+
+## 开发
+
+```sh
+npm test
+```
+
+60 个 `node:test` 用例，无需网络与真实安装：版本排序与安装目标校验、loopback 门禁、npm 安装任务（以 fake spawn 断言无 shell 的命令行）、重启交接的 payload 与三种拒绝、四条路由（跑在真实 HTTP server 上）。
 
 ## 安全模型
 
