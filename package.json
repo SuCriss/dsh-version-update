@@ -1,0 +1,56 @@
+{
+  "name": "dsh-version-update",
+  "description": "Version update menu for the dsh Web GUI settings panel: report the installed @deepseek-ai/dsh version against the npm latest/next channels, install a chosen version with one click, then restart the host and reload the page automatically.",
+  "version": "0.1.0",
+  "type": "module",
+  "author": "SuCriss",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/SuCriss/dsh-version-update#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SuCriss/dsh-version-update.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SuCriss/dsh-version-update/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "settings",
+    "update",
+    "self-update"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.2.0"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

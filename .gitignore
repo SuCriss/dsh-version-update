@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+# Scratch verification scripts and probes are written next to the plugin during
+# development; only the shipped plugin belongs in the repository.
+verify-*.mjs
+probe-*.mjs
+diagnose-*.mjs
+reproduce-*.mjs
+*.tgz
