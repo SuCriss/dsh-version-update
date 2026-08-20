@@ -25,6 +25,9 @@
     "node": "^22.19.0 || >=24.0.0"
   },
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node --test test/core.test.js test/loopback.test.js test/updater.test.js test/restarter.test.js test/routes.test.js"
+  },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
