@@ -1,0 +1,8 @@
+# dsh-version-update bundle patch: inserts the dual-face plugin row into the
+# web profile roster. The node half (exports ".") serves the loopback-only
+# /api/dsh-version-update routes in the host process; the `dsh.client`
+# declaration in package.json makes the browser half (exports "./client") load
+# in the Web GUI and register the 版本更新 settings page.
+- insert:
+    - id: version-update
+      name: 'dsh-version-update'

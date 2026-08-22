@@ -1,0 +1,37 @@
+name: CI
+
+# The plugin has no build step, so CI is exactly what a contributor runs locally:
+# the type check over the JSDoc the sources carry, and the test suite.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Both platforms matter to this plugin specifically: it resolves npm's CLI
+      # next to the node binary, spawns a detached relaunch helper, and waits for
+      # a listening port to be released — all of which behave differently on
+      # Windows than on Linux.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['22.19.0', '24.x']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No lockfile is committed (the only dependencies are dev tools), so a
+      # plain install is correct here.
+      - run: npm install
+
+      - run: npm run typecheck
+
+      - run: npm test
