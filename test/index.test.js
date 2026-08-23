@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { Config, VERSION_UPDATE_GUIDANCE, apply, inject, name } from '../lib/index.js'
+import { readRepository, resolveInstallationDir } from '../lib/core.js'
 
 /**
  * A cordis context stand-in recording what the plugin registers on it.
@@ -50,6 +51,9 @@ test('Config fills every field so apply never reads an absent option', () => {
     announceToAgent: true,
     registry: 'https://registry.npmjs.org',
     allowRestart: true,
+    releaseNotes: true,
+    autoCheckIntervalHours: 0,
+    autoRollbackOnFailedRestart: false,
   })
 })
 
@@ -59,6 +63,9 @@ test('Config rejects a mistyped entry instead of silently disabling a feature', 
   assert.throws(() => Config({ announceToAgent: 'yes' }), /announceToAgent/)
   assert.throws(() => Config({ registry: 5 }), /registry/)
   assert.throws(() => Config({ allowRestart: 1 }), /allowRestart/)
+  assert.throws(() => Config({ releaseNotes: 'no' }), /releaseNotes/)
+  assert.throws(() => Config({ autoCheckIntervalHours: 'daily' }), /autoCheckIntervalHours/)
+  assert.throws(() => Config({ autoRollbackOnFailedRestart: 3 }), /autoRollbackOnFailedRestart/)
 })
 
 test('Config serializes for the settings inventory', () => {
@@ -68,18 +75,23 @@ test('Config serializes for the settings inventory', () => {
   const json = Config.toJSON()
   const root = json.refs[String(json.uid)]
   assert.equal(root.type, 'object')
-  assert.deepEqual(Object.keys(root.dict).sort(), ['allowRestart', 'announceToAgent', 'registry'])
+  assert.deepEqual(Object.keys(root.dict).sort(), [
+    'allowRestart', 'announceToAgent', 'autoCheckIntervalHours', 'autoRollbackOnFailedRestart', 'registry', 'releaseNotes',
+  ])
   for (const [key, uid] of Object.entries(root.dict)) {
     const field = json.refs[String(uid)]
     assert.ok(field !== undefined, key)
-    assert.equal(field.type, key === 'registry' ? 'string' : 'boolean', key)
+    const want = key === 'registry' ? 'string' : key === 'autoCheckIntervalHours' ? 'number' : 'boolean'
+    assert.equal(field.type, want, key)
     assert.equal(typeof field.meta.description, 'string', key)
   }
 })
 
-test('apply registers the four routes and the announcement', () => {
+test('apply registers the base routes and the announcement', () => {
+  // With release notes disabled the composition mounts exactly the four core
+  // routes regardless of what the installed manifest names.
   const { ctx, registered, sections } = fakeContext()
-  apply(ctx, Config({}))
+  apply(ctx, Config({ releaseNotes: false }))
 
   assert.deepEqual(registered.map(route => route.path).sort(), [
     '/api/dsh-version-update/check',
@@ -90,6 +102,18 @@ test('apply registers the four routes and the announcement', () => {
   assert.equal(sections.length, 1)
   assert.equal(sections[0].name, 'plugin:dsh-version-update')
   assert.equal(sections[0].text, VERSION_UPDATE_GUIDANCE)
+})
+
+test('release notes mount exactly when the installed manifest names a repository', () => {
+  // The fifth route is conditional by design: no repository in the manifest,
+  // nothing to read notes from. The expectation is derived from the same
+  // resolution apply performs, so this test is portable across environments
+  // with and without an installed dsh.
+  const { ctx, registered } = fakeContext()
+  apply(ctx, Config({}))
+  const expected = readRepository(resolveInstallationDir()) !== undefined ? 5 : 4
+  assert.equal(registered.length, expected)
+  assert.equal(registered.some(route => route.path.endsWith('/notes')), expected === 5)
 })
 
 test('the announcement sits inside the tool-guidance band', () => {
@@ -103,7 +127,7 @@ test('the announcement sits inside the tool-guidance band', () => {
 
 test('announceToAgent false serves the routes without touching the prompt', () => {
   const { ctx, registered, sections } = fakeContext()
-  apply(ctx, Config({ announceToAgent: false }))
+  apply(ctx, Config({ announceToAgent: false, releaseNotes: false }))
   assert.equal(registered.length, 4)
   assert.deepEqual(sections, [])
 })
@@ -111,7 +135,7 @@ test('announceToAgent false serves the routes without touching the prompt', () =
 test('a host without a system prompt still serves the routes', () => {
   // Headless RPC compositions have no systemPrompt service.
   const { ctx, registered } = fakeContext({ systemPrompt: false })
-  apply(ctx, Config({}))
+  apply(ctx, Config({ releaseNotes: false }))
   assert.equal(registered.length, 4)
 })
 

@@ -287,6 +287,56 @@ test('dispose leaves a running install alone', (t) => {
   assert.equal(children[0].killed, false)
 })
 
+test('the settlement observer reports each run exactly once with its verdict', (t) => {
+  // The history records installs through this hook, so a duplicate report
+  // would fabricate history and a missed one would lose it.
+  const seen = []
+  const calls = []
+  const children = []
+  const updater = createUpdater({
+    npmCli: '/fake/npm-cli.js',
+    onSettled: (info) => { seen.push(info) },
+    spawnImpl: () => {
+      const child = new FakeChild()
+      children.push(child)
+      return child
+    },
+  })
+  t.after(() => {
+    for (const child of children) child.emit('close', 0)
+    updater.dispose()
+  })
+  void calls
+  updater.start('0.1.0')
+  children[0].emit('close', 0)
+  updater.start('0.2.0')
+  children[1].emit('close', 3)
+  assert.deepEqual(seen, [
+    { version: '0.1.0', ok: true },
+    { version: '0.2.0', ok: false },
+  ])
+})
+
+test('a settlement observer that throws cannot break the runner', (t) => {
+  const children = []
+  const updater = createUpdater({
+    npmCli: '/fake/npm-cli.js',
+    onSettled: () => { throw new Error('recorder exploded') },
+    spawnImpl: () => {
+      const child = new FakeChild()
+      children.push(child)
+      return child
+    },
+  })
+  t.after(() => {
+    for (const child of children) child.emit('close', 0)
+    updater.dispose()
+  })
+  updater.start('0.1.0')
+  assert.doesNotThrow(() => children[0].emit('close', 0))
+  assert.equal(updater.view().state, 'done', 'the task settled normally')
+})
+
 test('start reports a missing npm CLI as an actionable error', () => {
   const updater = createUpdater({
     execPath: '/nonexistent/node',

@@ -66,22 +66,29 @@ const PATHS = {
   update: '/api/dsh-version-update/update',
   status: '/api/dsh-version-update/status',
   restart: '/api/dsh-version-update/restart',
+  notes: '/api/dsh-version-update/notes',
 }
 
-test('the four routes are exact-path routes', () => {
+test('the four core routes are exact-path routes', () => {
   const { routes } = makeRoutes({ updater: fakeUpdater() })
-  assert.deepEqual(routes.map(route => route.path).sort(), Object.values(PATHS).sort())
+  assert.deepEqual(routes.map(route => route.path).sort(), [
+    PATHS.check, PATHS.restart, PATHS.status, PATHS.update,
+  ])
   assert.ok(routes.every(route => route.kind === 'exact'))
 })
 
 test('every route refuses a request the fence rejects', async () => {
+  // The four core routes always mount; the conditional notes route inherits
+  // the same fence through `guarded`, covered by its own tests below.
   await serving({ updater: fakeUpdater(), fence: () => false }, async (base) => {
-    for (const [name, path] of Object.entries(PATHS)) {
+    const core = [PATHS.check, PATHS.update, PATHS.status, PATHS.restart]
+    for (const [index, path] of core.entries()) {
       const get = await call(base + path)
-      assert.equal(get.status, 403, name)
+      assert.equal(get.status, 403, path)
       assert.match(get.body.error, /loopback-only/)
       const post = await call(base + path, { method: 'POST' })
-      assert.equal(post.status, 403, `${name} (POST)`)
+      assert.equal(post.status, 403, `${path} (POST)`)
+      void index
     }
   })
 })
@@ -317,5 +324,80 @@ test('a refused restart is a conflict, not a crash', async () => {
     const { status, body } = await call(base + PATHS.restart, { method: 'POST' })
     assert.equal(status, 409)
     assert.match(body.error, /OS-assigned port/)
+  })
+})
+
+test('the notes route mounts only when the composition wires it', async () => {
+  await serving({ updater: fakeUpdater(), fence: () => true }, async (base) => {
+    const response = await fetch(base + PATHS.notes + '?version=0.1.0')
+    assert.equal(response.status, 404, 'an unwired notes path falls through to the SPA-less 404')
+  })
+})
+
+test('the notes route serves one exact version and refuses the rest', async () => {
+  const reads = []
+  await serving({
+    updater: fakeUpdater(),
+    fence: () => true,
+    repoSlug: 'deepseek-ai/deepseek-harness',
+    notes: async (repo, version) => {
+      reads.push(`${repo}@${version}`)
+      return { notes: '# changes', url: 'https://github.com/x/releases/tag/v1' }
+    },
+  }, async (base) => {
+    const good = await call(base + PATHS.notes + '?version=0.1.0-rc.8')
+    assert.equal(good.status, 200)
+    assert.equal(good.body.result.version, '0.1.0-rc.8')
+    assert.equal(good.body.result.hasNotes, true)
+    assert.equal(good.body.result.notes, '# changes')
+    assert.deepEqual(reads, ['deepseek-ai/deepseek-harness@0.1.0-rc.8'])
+
+    for (const bad of ['latest', '0.1.x', '../evil']) {
+      const refused = await call(base + PATHS.notes + `?version=${encodeURIComponent(bad)}`)
+      assert.equal(refused.status, 400, bad)
+      assert.deepEqual(reads.length, 1, `${bad} never reached the reader`)
+    }
+  })
+})
+
+test('a failed upstream notes read answers 502, blaming GitHub not the host', async () => {
+  await serving({
+    updater: fakeUpdater(),
+    fence: () => true,
+    repoSlug: 'o/r',
+    notes: async () => { throw new Error('HTTP 403') },
+  }, async (base) => {
+    const { status, body } = await call(base + PATHS.notes + '?version=1.0.0')
+    assert.equal(status, 502)
+    assert.match(body.error, /HTTP 403/)
+  })
+})
+
+test('check and status carry the ambient auto-check and rollback facts', async () => {
+  const history = {
+    rollbackTarget: '0.2.0',
+    recent: [{ at: 1, from: '0.2.0', to: '0.3.0', result: 'ok' }],
+  }
+  let autoCheckReads = 0
+  await serving({
+    updater: fakeUpdater(),
+    fence: () => true,
+    running: '0.3.0',
+    installDir: process.cwd(),
+    autoCheck: () => {
+      autoCheckReads += 1
+      return { checkedAt: 1234, updateAvailable: true, latestVersion: '0.4.0' }
+    },
+    historySummary: () => history,
+  }, async (base) => {
+    const check = await call(base + PATHS.check)
+    assert.deepEqual(check.body.result.autoCheck, { checkedAt: 1234, updateAvailable: true, latestVersion: '0.4.0' })
+    assert.deepEqual(check.body.result.rollbackTarget, '0.2.0')
+    assert.equal(check.body.result.recent.length, 1)
+
+    const status = await call(base + PATHS.status)
+    assert.equal(status.body.result.autoCheck.updateAvailable, true, 'the watchdog polls the same facts')
+    assert.equal(status.body.result.rollbackTarget, '0.2.0')
+    assert.ok(autoCheckReads >= 2, 'the getter is consulted per request, so live state is served')
   })
 })

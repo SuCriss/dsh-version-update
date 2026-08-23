@@ -1,12 +1,54 @@
 # Changelog
 
 All notable changes to this plugin. Versions follow semver over the plugin's own
-surface: its entry config, its four routes, and the settings page it renders.
+surface: its entry config, its route family, and the settings page it renders.
 
-## [Unreleased]
+## [0.4.0]
 
 ### Added
 
+- **Release notes on the confirmation card.** Confirming an install now shows
+  the target version's GitHub release notes (dsh publishes bilingual bodies
+  under `dsh-v*` tags) with a link to the full text, so the decision is made
+  against what changed rather than a bare version number. The repository is
+  derived from the installed manifest; a version without a release, a disabled
+  config (`releaseNotes: false`, the default is on), or any fetch failure all
+  render as nothing — the card annotates the decision, it never gates it. The
+  new `GET /api/dsh-version-update/notes` route serves this, cached per
+  version for an hour, misses included, behind the same loopback fence.
+- **Rollback from recorded history.** Every settled install appends one line
+  to `~/.dsh-version-update/history.json` (capped at 50 entries); when the
+  newest successful entry is exactly the one that produced the on-disk
+  version, the panel offers 回滚到 *that origin*. Anything else — a failed
+  install in between, another update since — withdraws the offer instead of
+  pointing somewhere wrong. A rollback flows through the ordinary confirm
+  card, where its older target reads as a downgrade.
+- **Opt-in automatic rollback when a restart goes bad**
+  (`autoRollbackOnFailedRestart`, default **off**). With it armed, the
+  detached relaunch helper waits up to 60 s for the replacement to become
+  reachable; if it never does, the helper reinstalls the version the exiting
+  process was running and starts a replacement on that, logging every step to
+  `restart.log`. Off by default because the recovery reinstall runs while the
+  broken replacement may still hold files — most relevant on Windows.
+- **Periodic auto-check** (`autoCheckIntervalHours`, default `0` = off). When
+  enabled the host polls the registry on that cadence (floored at hourly),
+  exposes the verdict through `/check` and `/status`, and — on a discovery —
+  registers a pending announcement so the model can surface the finding
+  proactively. A fresh process after the update re-evaluates from scratch.
+- Also fixed on the way: the "全部已发布版本" card's primary button referenced
+  an undefined dictionary key (`updateTo`) and rendered that literal string;
+  both dictionaries now carry proper copy (`更新到 {version}` / *Update to
+  {version}*).
+
+### Fixed
+
+- **The single install slot is now process-wide.** A config change reloads
+  this plugin's fiber, and disposal deliberately leaves a running npm alive —
+  but the replacement runner used to see only its own fresh idle state, so a
+  second click after a reload would spawn a second npm while the first still
+  wrote the global tree. The slot now lives in module state: every runner in
+  this process refuses until the orphaned run settles, which its surviving
+  close listener still reports.
 - **A downgrade is named a downgrade.** The version list always allowed
   installing an older release (that is what a rollback is), but the button and
   the confirmation card called it an update like any other. When the target
@@ -21,17 +63,6 @@ surface: its entry config, its four routes, and the settings page it renders.
   problem. It now answers 200 with those local facts plus a `publishedError`
   reason and no `channels` / `versions`; the panel shows a warning beside them
   instead of flipping into its error state.
-- **The single install slot is now process-wide.** A config change reloads
-  this plugin's fiber, and disposal deliberately leaves a running npm alive —
-  but the replacement runner used to see only its own fresh idle state, so a
-  second click after a reload would spawn a second npm while the first still
-  wrote the global tree. The slot now lives in module state: every runner in
-  this process refuses until the orphaned run settles, which its surviving
-  close listener still reports.
-- Also fixed on the way: the "全部已发布版本" card's primary button referenced
-  an undefined dictionary key (`updateTo`) and rendered that literal string;
-  both dictionaries now carry proper copy (`更新到 {version}` / *Update to
-  {version}*).
 
 ## [0.3.0]
 

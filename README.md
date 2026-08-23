@@ -11,8 +11,11 @@ DeepSeek Harness Web GUI 的「版本更新」设置菜单：在设置面板左�
 - 列出 npm dist-tag 通道（`latest` 稳定版 / `next` 预发布）及各自版本，并标注是否比本机版本新。
 - 列出全部已发布版本，可任选一个作为更新目标。
 - 一键更新：先弹出确认（说明会改写本机全局包并结束宿主进程），确认后宿主进程后台执行 `npm install -g @deepseek-ai/dsh@<版本>`，页面每 1.5 秒轮询任务状态并展示实时安装日志（日志自动跟到最新一行，手动上滚后停止跟随）。
-- 降级同样是一键可达：选择比当前旧的版本时，按钮与确认卡片都会明确说「降级」而不是「更新」，避免把回退误当升级。
+- **发布说明**：确认卡片会读取目标版本的 GitHub Release 说明（dsh 以 `dsh-v*` 标签发布双语说明），附「查看完整说明」链接——决定更新前先看改了什么。没有对应 Release、关闭了配置或网络失败时静默省略，绝不阻塞安装。
+- **降级同样是一键可达**：选择比当前旧的版本时，按钮与确认卡片都会明确说「降级」而不是「更新」，避免把回退误当升级。
+- **一键回滚**：每次安装结果都记入 `~/.dsh-version-update/history.json`（上限 50 条）。当最近一次成功安装恰好就是磁盘上当前版本的来源时，面板提供「回滚到 x.y.z」；历史不再明确时提示自动撤回，而不是指向一个错误的目标。回滚走同一条降级确认流。
 - registry 读不到时优雅降级：`check` 仍返回 200 与本机事实（安装版本、安装路径、任务视图），只把失败原因放进 `publishedError`，面板在本地信息旁提示网络问题——断网时面板不再一片空白。
+- **定时自动检查**（可选）：按配置的小时间隔（下限 1 小时）后台检查新版本，结论通过 `/check` 与 `/status` 暴露；发现新版本时会在 agent 的系统提示中追加一条待处理通告，模型可以主动告知。
 - 安装成功后自动重启：20 秒倒计时（可取消）后交接端口拉起新进程，页面等新进程应答再 `location.reload()`。
 
 ## 为什么必须重启，而不是只刷新
@@ -31,11 +34,12 @@ DeepSeek Harness Web GUI 的「版本更新」设置菜单：在设置面板左�
 
 三个半区在同一个包里：
 
-- Host 半区（`lib/index.js`，exports `.`）注册四条路由：
-  - `GET /api/dsh-version-update/check` — 安装版本 + registry 通道 + 全部版本 + 任务视图（含 `running` / `stale` / `needsRestart` / `restartable`）。registry 读失败时不报错：响应仍是 200，带本机事实与 `publishedError`，但不含 `channels` / `versions`。
+- Host 半区（`lib/index.js`，exports `.`）注册四条核心路由（外加一条条件挂载的 notes 路由）：
+  - `GET /api/dsh-version-update/check` — 安装版本 + registry 通道 + 全部版本 + 任务视图（含 `running` / `stale` / `needsRestart` / `restartable`），以及自动检查结论与回滚提示。registry 读失败时不报错：响应仍是 200，带本机事实与 `publishedError`，但不含 `channels` / `versions`。
   - `POST /api/dsh-version-update/update` — 以 `{ "version": "0.1.0-rc.8" }` 启动一次安装。超出 4 KiB 返回 413，非法 JSON 返回 400。
-  - `GET /api/dsh-version-update/status` — 读取当前（或上一次）任务状态、日志与 staleness。
+  - `GET /api/dsh-version-update/status` — 读取当前（或上一次）任务状态、日志与 staleness，同样携带 ambient 字段。
   - `POST /api/dsh-version-update/restart` — 交接端口重启宿主进程。
+  - `GET /api/dsh-version-update/notes?version=…` — 目标版本的 GitHub 发布说明（每版本缓存一小时，含未命中）。仅在 `releaseNotes` 开启且安装清单能解析出 GitHub 仓库时挂载；上游失败返回 502。
 - 浏览器半区（`lib/client.js`，exports `./client`）注册字典、「版本更新」页面，以及一个不依赖 React 的重启 watchdog。
 - 脱离父进程的重启助手（`lib/relaunch.js`）由 host 在重启时 spawn。
 
@@ -84,21 +88,24 @@ dsh plugin --profile web add github:SuCriss/dsh-version-update
 - `announceToAgent`（默认 true）— 是否向 agent 注入本插件的说明段落。
 - `registry`（默认 `https://registry.npmjs.org`）— registry 基地址。**读取版本信息和执行安装都用它**：安装会带上 `--registry <值>`，否则配了镜像的部署会从镜像列出版本、却从 npmjs 下载。必须是绝对 http(s) URL，否则挂载即失败（这个值会进入 npm 命令行）。
 - `allowRestart`（默认 true）— 置为 false 则不提供重启路由，页面只提示需要手动重启。
+- `releaseNotes`（默认 true）— 是否在确认卡片读取并展示目标版本的 GitHub 发布说明；同时控制 notes 路由是否挂载。
+- `autoCheckIntervalHours`（默认 0，即关闭）— 定时自动检查的小时间隔（下限 1 小时，防止笔误值打爆 registry）。发现新版本会更新 `/check`、`/status` 的 ambient 字段并在 agent 提示中追加待处理通告。
+- `autoRollbackOnFailedRestart`（默认 false）— 重启后新进程 60 秒内始终不可达时，relaunch 助手自动重装上一个版本并重新拉起，全程记录到 `restart.log`。默认关闭：恢复性重装发生在坏进程可能仍占用文件的窗口内（Windows 上尤其如此），请自行权衡后开启。
 
 ## 开发
 
 ```sh
-npm test          # 107 个 node:test 用例
+npm test          # 127 个 node:test 用例
 npm run typecheck # tsc --checkJs，无需构建产物
 ```
 
-用例不需要网络与真实安装：版本排序与安装目标校验、registry URL 规范化、loopback 门禁、npm 安装任务（以 fake spawn 断言无 shell 的命令行与 `--registry` 传递、跨 fiber 的进程级安装槽）、重启交接的 payload 与端口拒绝、四条路由（跑在真实 HTTP server 上，含 registry 失败的降级响应）、插件入口的 schema 与接线，以及浏览器侧控制器（确认、倒计时、跨刷新 watchdog、未挂载诊断——通过 `createController` 注入 fake overlay 与 reload）。浏览器半区镜像宿主的版本排序由一份双端同矩阵的对拍测试钉住。
+用例不需要网络与真实安装：版本排序与安装目标校验、registry URL 规范化、loopback 门禁、npm 安装任务（以 fake spawn 断言无 shell 的命令行与 `--registry` 传递、跨 fiber 的进程级安装槽、结算回调恰好一次）、安装历史与回滚目标推导、仓库 slug 与发布说明抓取（含 tag 回退与缓存）、重启交接的 payload 与端口拒绝、路由族（跑在真实 HTTP server 上，含 registry 失败的降级响应与 notes 的条件挂载）、插件入口的 schema 与接线，以及浏览器侧控制器（确认、倒计时、跨刷新 watchdog、未挂载诊断——通过 `createController` 注入 fake overlay 与 reload）。浏览器半区镜像宿主的版本排序由一份双端同矩阵的对拍测试钉住。
 
 `tsconfig.json` 只做类型检查、不产出文件：`checkJs` 让源码里已有的 JSDoc 真正生效。`lib/client.js` 与测试不在检查范围内（前者的 `require` 属于 `window.__ModuleLoader__` 而非 Node，后者几乎全由刻意残缺的 fake 构成）。
 
 ## 安全模型
 
-- 四条路由全部走 loopback 门禁：要求 loopback socket 地址、loopback Host 头、非跨站来源（`sec-fetch-site` / `Origin`）。远程或 LAN 浏览器一律 403——这些路由会联网、在本机写入全局 npm 包，并能结束宿主进程。
+- 四条核心路由与条件挂载的 notes 路由全部走 loopback 门禁：要求 loopback socket 地址、loopback Host 头、非跨站来源（`sec-fetch-site` / `Origin`）。远程或 LAN 浏览器一律 403——这些路由会联网、在本机写入全局 npm 包，并能结束宿主进程。
 - 安装目标只接受精确的已发布版本号（`major.minor.patch` 加可选预发布段），range、dist-tag、路径与任何含 shell 元字符的值都被拒绝。
 - npm 在所有平台都以无 shell 方式 spawn：解析出 node 旁的 `npm-cli.js` 后执行 `node npm-cli.js install -g …`，版本参数不经任何命令行解析器。
 - `registry` 配置项在挂载时校验为绝对 http(s) URL 后才允许出现在 npm 命令行上，`--proxy=…` 之类冒充参数的值进不去。
@@ -119,6 +126,7 @@ npm run typecheck # tsc --checkJs，无需构建产物
 - 宿主进程需要能找到 node 旁的 npm CLI；找不到时页面报错并提示改用终端更新。
 - 导航图标依赖按可见标签匹配自己的那一行：若未来某个插件把菜单项做成完全相同的文字，两行都会被换成本插件的图标。设置面板一旦提供图标字段，这段适配应当整体删除。为此监听 `document.body` 的 MutationObserver 会把回调合并到下一帧，避免聊天流逐 token 的 `characterData` 变更把空闲插件变成开销。
 - Windows 上 npm 常因文件被占用而无法清理旧目录（`EPERM ... koffi.node`），会在 `@deepseek-ai\.dsh-<随机后缀>` 留下残留目录。安装本身仍然成功，残留可在重启后手动删除。
+- `autoRollbackOnFailedRestart` 的恢复性重装同样受上述 Windows 文件占用影响：坏掉的替换进程若仍持有文件，回滚安装可能失败（助手会记录并放弃，不会让状态更糟）。这也是它默认关闭的原因之一。
 
 ## 许可
 

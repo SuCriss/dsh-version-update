@@ -1,7 +1,7 @@
 {
   "name": "dsh-version-update",
   "description": "Version update menu for the dsh Web GUI settings panel: report the installed @deepseek-ai/dsh version against the npm latest/next channels, install a chosen version with one click, then restart the host and reload the page automatically.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "author": "SuCriss",
   "license": "Apache-2.0",
@@ -26,7 +26,7 @@
   },
   "main": "lib/index.js",
   "scripts": {
-    "test": "node --test test/core.test.js test/loopback.test.js test/updater.test.js test/restarter.test.js test/routes.test.js test/index.test.js test/client.test.js",
+    "test": "node --test test/core.test.js test/history.test.js test/loopback.test.js test/updater.test.js test/restarter.test.js test/routes.test.js test/index.test.js test/client.test.js",
     "typecheck": "tsc -p tsconfig.json"
   },
   "exports": {

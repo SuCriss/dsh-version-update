@@ -11,8 +11,11 @@ A **版本更新 / Version update** page for the DeepSeek Harness Web GUI settin
 - Lists the npm dist-tag channels (`latest` for stable, `next` for pre-releases) with their versions, marking a channel that is ahead of what is installed.
 - Lists every published version, any of which can be picked as the update target.
 - One-click update: a confirmation card first states that the action rewrites this machine's global package and then ends the host; on confirmation the host runs `npm install -g @deepseek-ai/dsh@<version>` in the background while the page polls the task every 1.5 s and streams the install log (pinned to the newest line until you scroll up).
+- **Release notes on the card**: the confirmation reads the target version's GitHub release notes (dsh publishes bilingual bodies under `dsh-v*` tags) with a link to the full text — decide against what changed, not a bare number. A version without a release, a disabled config, or any fetch failure renders as nothing and never gates the install.
 - Downgrades are one click away too: picking a version older than the installed one labels the button and the confirmation card as a **downgrade**, never as an update, so a rollback cannot masquerade as an upgrade.
+- **One-click rollback**: every settled install appends to `~/.dsh-version-update/history.json` (capped at 50 entries). When the newest successful entry is exactly the one that produced the on-disk version, the panel offers *Roll back to x.y.z*; whenever history stops being unambiguous the offer withdraws rather than pointing somewhere wrong. A rollback flows through the ordinary confirmation, where its older target reads as a downgrade.
 - Graceful degradation when the registry is unreachable: `check` still answers 200 with the local facts (installed version, install path, task view) and carries the failure reason in `publishedError`; the panel shows a warning beside them. An offline machine no longer blanks the panel.
+- **Periodic auto-check** (optional): on the configured hourly cadence (floored at 1 hour) the host re-reads the registry, exposes the verdict through `/check` and `/status`, and — on a discovery — registers a pending announcement so the model can surface the finding proactively.
 - Automatic restart on success: a 20-second countdown (cancellable) hands the port over to a replacement process, and the page reloads once that replacement answers.
 
 ## Why a restart is required, not just a reload
@@ -31,11 +34,12 @@ The page acts on the wider `needsRestart`: `stale`, **or** an install that finis
 
 Three halves ship in one package:
 
-- The **host half** (`lib/index.js`, exports `.`) registers four routes:
-  - `GET /api/dsh-version-update/check` — installed version + registry channels + every version + the task view (carrying `running` / `stale` / `needsRestart` / `restartable`). A failed registry read is not an error: the response stays 200 with the local facts and a `publishedError`, omitting `channels` / `versions`.
+- The **host half** (`lib/index.js`, exports `.`) registers four core routes plus one conditionally mounted notes route:
+  - `GET /api/dsh-version-update/check` — installed version + registry channels + every version + the task view (carrying `running` / `stale` / `needsRestart` / `restartable`), plus the auto-check verdict and the rollback offer. A failed registry read is not an error: the response stays 200 with the local facts and a `publishedError`, omitting `channels` / `versions`.
   - `POST /api/dsh-version-update/update` — start one install with `{ "version": "0.1.0-rc.8" }`. A body over 4 KiB answers 413; malformed JSON answers 400.
-  - `GET /api/dsh-version-update/status` — read the current (or last) task state, its log, and the staleness facts.
+  - `GET /api/dsh-version-update/status` — read the current (or last) task state, its log, the staleness facts, and the same ambient fields.
   - `POST /api/dsh-version-update/restart` — hand the port over and restart the host process.
+  - `GET /api/dsh-version-update/notes?version=…` — the GitHub release notes of one exact version (cached per version for an hour, misses included). Mounted only when `releaseNotes` is on AND the installed manifest resolves to a GitHub repository; an upstream failure answers 502.
 - The **browser half** (`lib/client.js`, exports `./client`) registers the dictionaries, the 版本更新 page, and a restart watchdog that does not depend on React.
 - The **detached restart helper** (`lib/relaunch.js`) is spawned by the host at restart time.
 
@@ -84,21 +88,24 @@ The composition-layer entry config is validated by a `Config` schema (`@deepseek
 - `announceToAgent` (default `true`) — whether to inject this plugin's guidance section for the agent.
 - `registry` (default `https://registry.npmjs.org`) — the registry base URL. **Both the version read and the install use it**: the install passes `--registry <value>`, because otherwise a mirror-configured deployment would list a version from the mirror and then download it from npmjs. It must be an absolute http(s) URL or the mount fails — the value reaches an npm command line.
 - `allowRestart` (default `true`) — set to `false` to omit the restart route; the page then only says a manual restart is needed.
+- `releaseNotes` (default `true`) — read and show the target version's GitHub release notes on the confirmation card; also controls whether the notes route mounts.
+- `autoCheckIntervalHours` (default `0`, off) — hours between automatic registry checks (floored at 1 hour so a typo cannot hammer the registry). A discovery updates the ambient fields on `/check` and `/status` and registers a pending agent announcement.
+- `autoRollbackOnFailedRestart` (default `false`) — when a replacement never becomes reachable within 60 s, the relaunch helper reinstalls the previous version and starts over, logging every step to `restart.log`. Off by default: the recovery reinstall runs while the broken replacement may still hold files — most relevant on Windows.
 
 ## Development
 
 ```sh
-npm test          # 107 node:test cases
+npm test          # 127 node:test cases
 npm run typecheck # tsc --checkJs, no build output
 ```
 
-None of the cases need the network or a real install: version ranking and install-target validation, registry-URL normalization, the loopback fence, the npm install task (asserting the shell-free command line and the `--registry` passthrough through a fake spawn, plus the process-wide install slot across fibers), the restart handoff's payload and its port refusals, the four routes exercised over a real HTTP server (including the degraded response when the registry read fails), the plugin entry's schema and wiring, and the browser-side controller (confirmation, countdown, the reload-surviving watchdog, the not-mounted diagnosis — reached through `createController` with a fake overlay and reload). The browser half's mirrored version ranking is pinned by a test that walks both implementations through the same version matrix.
+None of the cases need the network or a real install: version ranking and install-target validation, registry-URL normalization, the loopback fence, the npm install task (asserting the shell-free command line and the `--registry` passthrough through a fake spawn, plus the process-wide install slot across fibers and the exactly-once settlement observer), install history and rollback-target derivation, repository-slug parsing and release-notes fetching (tag fallback and caching), the restart handoff's payload and its port refusals, the route family exercised over a real HTTP server (including the degraded registry-failure response and the conditional notes mount), the plugin entry's schema and wiring, and the browser-side controller (confirmation, countdown, the reload-surviving watchdog, the not-mounted diagnosis — reached through `createController` with a fake overlay and reload). The browser half's mirrored version ranking is pinned by a test that walks both implementations through the same version matrix.
 
 `tsconfig.json` type-checks only and emits nothing: `checkJs` makes the JSDoc the sources already carry into real constraints. `lib/client.js` and the tests are out of scope (the former's `require` belongs to `window.__ModuleLoader__` rather than Node; the latter are built almost entirely from deliberately partial fakes).
 
 ## Security model
 
-- All four routes sit behind a loopback fence: a loopback socket address, a loopback `Host` header, and a non-cross-site origin (`sec-fetch-site` / `Origin`). A remote or LAN browser gets 403 — these routes reach the network, write a global npm package on this machine, and can end the host process.
+- All four core routes and the conditionally mounted notes route sit behind a loopback fence: a loopback socket address, a loopback `Host` header, and a non-cross-site origin (`sec-fetch-site` / `Origin`). A remote or LAN browser gets 403 — these routes reach the network, write a global npm package on this machine, and can end the host process.
 - The install target accepts one exact published version only (`major.minor.patch` plus an optional pre-release segment); ranges, dist-tags, paths, and any value carrying a shell metacharacter are rejected.
 - npm is spawned without a shell on every platform: the runner resolves npm's own `npm-cli.js` next to the running node binary and runs `node npm-cli.js install -g …`, so the version argument never reaches a command-line parser.
 - The configured `registry` is validated as an absolute http(s) URL at mount time before it may appear on that command line, so a value posing as another flag (`--proxy=…`) never gets there.
@@ -119,6 +126,7 @@ None of the cases need the network or a real install: version ranking and instal
 - The host needs to be able to find npm's CLI next to the running node binary; when it cannot, the page reports the error and suggests updating from a terminal instead.
 - The navigation icon relies on matching its own row by visible label: should another plugin ever ship a settings entry with exactly the same text, both rows would get this plugin's icon. Once the settings panel offers an icon field, this adaptation should be deleted wholesale. The MutationObserver it needs watches `document.body`, so its callback is coalesced into one animation frame — otherwise a chat stream's per-token `characterData` mutations would make an idle plugin expensive.
 - On Windows npm often cannot clean up the old directory because files are in use (`EPERM ... koffi.node`), leaving a residual `@deepseek-ai\.dsh-<random suffix>` directory behind. The install itself still succeeds, and the leftover can be deleted manually after a restart.
+- `autoRollbackOnFailedRestart`'s recovery reinstall is subject to the same Windows file-locking: if the broken replacement still holds files, the rollback install may fail (the helper logs it and gives up without making anything worse). That is one more reason it defaults to off.
 
 ## License
 
