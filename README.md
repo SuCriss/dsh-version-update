@@ -11,6 +11,8 @@ DeepSeek Harness Web GUI 的「版本更新」设置菜单：在设置面板左�
 - 列出 npm dist-tag 通道（`latest` 稳定版 / `next` 预发布）及各自版本，并标注是否比本机版本新。
 - 列出全部已发布版本，可任选一个作为更新目标。
 - 一键更新：先弹出确认（说明会改写本机全局包并结束宿主进程），确认后宿主进程后台执行 `npm install -g @deepseek-ai/dsh@<版本>`，页面每 1.5 秒轮询任务状态并展示实时安装日志（日志自动跟到最新一行，手动上滚后停止跟随）。
+- 降级同样是一键可达：选择比当前旧的版本时，按钮与确认卡片都会明确说「降级」而不是「更新」，避免把回退误当升级。
+- registry 读不到时优雅降级：`check` 仍返回 200 与本机事实（安装版本、安装路径、任务视图），只把失败原因放进 `publishedError`，面板在本地信息旁提示网络问题——断网时面板不再一片空白。
 - 安装成功后自动重启：20 秒倒计时（可取消）后交接端口拉起新进程，页面等新进程应答再 `location.reload()`。
 
 ## 为什么必须重启，而不是只刷新
@@ -30,7 +32,7 @@ DeepSeek Harness Web GUI 的「版本更新」设置菜单：在设置面板左�
 三个半区在同一个包里：
 
 - Host 半区（`lib/index.js`，exports `.`）注册四条路由：
-  - `GET /api/dsh-version-update/check` — 安装版本 + registry 通道 + 全部版本 + 任务视图（含 `running` / `stale` / `needsRestart` / `restartable`）。
+  - `GET /api/dsh-version-update/check` — 安装版本 + registry 通道 + 全部版本 + 任务视图（含 `running` / `stale` / `needsRestart` / `restartable`）。registry 读失败时不报错：响应仍是 200，带本机事实与 `publishedError`，但不含 `channels` / `versions`。
   - `POST /api/dsh-version-update/update` — 以 `{ "version": "0.1.0-rc.8" }` 启动一次安装。超出 4 KiB 返回 413，非法 JSON 返回 400。
   - `GET /api/dsh-version-update/status` — 读取当前（或上一次）任务状态、日志与 staleness。
   - `POST /api/dsh-version-update/restart` — 交接端口重启宿主进程。
@@ -86,11 +88,11 @@ dsh plugin --profile web add github:SuCriss/dsh-version-update
 ## 开发
 
 ```sh
-npm test          # 99 个 node:test 用例
+npm test          # 107 个 node:test 用例
 npm run typecheck # tsc --checkJs，无需构建产物
 ```
 
-用例不需要网络与真实安装：版本排序与安装目标校验、registry URL 规范化、loopback 门禁、npm 安装任务（以 fake spawn 断言无 shell 的命令行与 `--registry` 传递）、重启交接的 payload 与端口拒绝、四条路由（跑在真实 HTTP server 上）、插件入口的 schema 与接线，以及浏览器侧控制器（确认、倒计时、跨刷新 watchdog、未挂载诊断——通过 `createController` 注入 fake overlay 与 reload）。
+用例不需要网络与真实安装：版本排序与安装目标校验、registry URL 规范化、loopback 门禁、npm 安装任务（以 fake spawn 断言无 shell 的命令行与 `--registry` 传递、跨 fiber 的进程级安装槽）、重启交接的 payload 与端口拒绝、四条路由（跑在真实 HTTP server 上，含 registry 失败的降级响应）、插件入口的 schema 与接线，以及浏览器侧控制器（确认、倒计时、跨刷新 watchdog、未挂载诊断——通过 `createController` 注入 fake overlay 与 reload）。浏览器半区镜像宿主的版本排序由一份双端同矩阵的对拍测试钉住。
 
 `tsconfig.json` 只做类型检查、不产出文件：`checkJs` 让源码里已有的 JSDoc 真正生效。`lib/client.js` 与测试不在检查范围内（前者的 `require` 属于 `window.__ModuleLoader__` 而非 Node，后者几乎全由刻意残缺的 fake 构成）。
 
@@ -101,9 +103,9 @@ npm run typecheck # tsc --checkJs，无需构建产物
 - npm 在所有平台都以无 shell 方式 spawn：解析出 node 旁的 `npm-cli.js` 后执行 `node npm-cli.js install -g …`，版本参数不经任何命令行解析器。
 - `registry` 配置项在挂载时校验为绝对 http(s) URL 后才允许出现在 npm 命令行上，`--proxy=…` 之类冒充参数的值进不去。
 - 请求体上限 4 KiB（更新请求只是一个小 JSON 对象）。
-- 更新按钮不会一击生效：面板先展示一张说明影响的确认卡片。
+- 更新按钮不会一击生效：面板先展示一张说明影响的确认卡片；目标是更旧版本时，卡片与按钮都按「降级」措辞。
 - 重启只重放宿主自己的 `process.argv`，不接受请求体里的任何命令、参数或路径。
-- 同时只允许一个安装任务；正在运行时再次请求返回 409，不排队（两个并发全局安装会争抢同一目录）。
+- 同时只允许一个安装任务，且这个约束是**进程级**的：插件因配置变更被热重载后，新 fiber 的运行器依然会拒绝启动——上一个 npm 还在写全局目录，直到那次运行自己结束（409，不排队；两个并发全局安装会争抢同一目录）。
 - 单次安装 10 分钟超时；插件卸载时不会中断正在进行的安装（中途 kill npm 可能留下半写的全局包目录）。
 
 ## 已知限制

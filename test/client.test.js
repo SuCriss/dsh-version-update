@@ -335,3 +335,88 @@ test('check adopts the facts and preselects the channel that is ahead', async ()
   assert.equal(snapshot.selected, '0.2.0', 'the version worth installing is preselected')
   controller.dispose()
 })
+
+test('a failed registry read degrades to local facts instead of an error page', async () => {
+  // The host answers 200 with `publishedError` and no version lists when the
+  // registry is unreachable; the panel must keep showing the installed
+  // version and path beside the warning, not flip into its error state.
+  const module = await loadClient()
+  fakeFetch({
+    '/check': () => json({
+      result: {
+        installed: '0.1.0',
+        installDir: '/opt/dsh',
+        publishedError: 'registry read failed: HTTP 503',
+        task: { state: 'idle', log: '' },
+      },
+    }),
+  })
+  const { controller } = makeController(module)
+
+  await controller.check()
+  const snapshot = controller.getSnapshot()
+  assert.equal(snapshot.status, 'ready', 'local facts are not a page error')
+  assert.equal(snapshot.installed, '0.1.0')
+  assert.equal(snapshot.publishedError, 'registry read failed: HTTP 503')
+  assert.deepEqual(snapshot.channels, [])
+  assert.deepEqual(snapshot.versions, [])
+  controller.dispose()
+})
+
+test('a later successful check clears an earlier degradation marker', async () => {
+  const module = await loadClient()
+  const responses = [
+    () => json({ result: { installed: '0.1.0', publishedError: 'fetch failed', task: { state: 'idle', log: '' } } }),
+    () => json({
+      result: {
+        installed: '0.1.0',
+        channels: [{ channel: 'latest', version: '0.1.0', ahead: false }],
+        versions: ['0.1.0'],
+        task: { state: 'idle', log: '' },
+      },
+    }),
+  ]
+  let call = 0
+  globalThis.fetch = async () => responses[Math.min(call++, responses.length - 1)]()
+  const { controller } = makeController(module)
+
+  await controller.check()
+  assert.equal(controller.getSnapshot().publishedError, 'fetch failed')
+  await controller.check()
+  assert.equal(controller.getSnapshot().publishedError, undefined, 'the warning does not stick')
+  controller.dispose()
+})
+
+test('the browser version ranking mirrors the host ranking exactly', async () => {
+  // compareVersionTexts is a hand-maintained mirror of lib/core.js — the
+  // browser half ships standalone with no shared import — so every pair must
+  // rank identically on both sides or "downgrade" means different things in
+  // the button label and in the install itself.
+  const core = await import('../lib/core.js')
+  const client = await loadClient()
+  const versions = [
+    '0.0.1', '0.1.0', '0.2.0', '1.0.0',
+    '0.1.0-alpha', '0.1.0-alpha.1', '0.1.0-alpha.beta', '0.1.0-beta',
+    '0.1.0-beta.2', '0.1.0-beta.11', '0.1.0-rc.1', '0.2.0-rc.1', '0.2.0-next.1',
+  ]
+  for (const a of versions) {
+    for (const b of versions) {
+      assert.equal(
+        Math.sign(client.compareVersionTexts(a, b)),
+        Math.sign(core.compareVersions(a, b)),
+        `${a} vs ${b}`,
+      )
+    }
+  }
+})
+
+test('isDowngrade names rollbacks and nothing else', async () => {
+  const client = await loadClient()
+  assert.equal(client.isDowngrade('0.0.9', '0.1.0'), true, 'an older release')
+  assert.equal(client.isDowngrade('0.2.0-rc.1', '0.2.0'), true, 'a pre-release of the current core')
+  assert.equal(client.isDowngrade('0.1.0', '0.1.0'), false, 'the same version')
+  assert.equal(client.isDowngrade('0.2.0', '0.1.0'), false, 'an upgrade')
+  assert.equal(client.isDowngrade('0.1.0-next.1', '0.1.0-alpha'), false, 'a pre-release bump')
+  assert.equal(client.isDowngrade(undefined, '0.1.0'), false, 'no target selected')
+  assert.equal(client.isDowngrade('garbage', '0.1.0'), false, 'uncomparable values are never called a downgrade')
+})

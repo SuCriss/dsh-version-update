@@ -11,6 +11,8 @@ A **版本更新 / Version update** page for the DeepSeek Harness Web GUI settin
 - Lists the npm dist-tag channels (`latest` for stable, `next` for pre-releases) with their versions, marking a channel that is ahead of what is installed.
 - Lists every published version, any of which can be picked as the update target.
 - One-click update: a confirmation card first states that the action rewrites this machine's global package and then ends the host; on confirmation the host runs `npm install -g @deepseek-ai/dsh@<version>` in the background while the page polls the task every 1.5 s and streams the install log (pinned to the newest line until you scroll up).
+- Downgrades are one click away too: picking a version older than the installed one labels the button and the confirmation card as a **downgrade**, never as an update, so a rollback cannot masquerade as an upgrade.
+- Graceful degradation when the registry is unreachable: `check` still answers 200 with the local facts (installed version, install path, task view) and carries the failure reason in `publishedError`; the panel shows a warning beside them. An offline machine no longer blanks the panel.
 - Automatic restart on success: a 20-second countdown (cancellable) hands the port over to a replacement process, and the page reloads once that replacement answers.
 
 ## Why a restart is required, not just a reload
@@ -30,7 +32,7 @@ The page acts on the wider `needsRestart`: `stale`, **or** an install that finis
 Three halves ship in one package:
 
 - The **host half** (`lib/index.js`, exports `.`) registers four routes:
-  - `GET /api/dsh-version-update/check` — installed version + registry channels + every version + the task view (carrying `running` / `stale` / `needsRestart` / `restartable`).
+  - `GET /api/dsh-version-update/check` — installed version + registry channels + every version + the task view (carrying `running` / `stale` / `needsRestart` / `restartable`). A failed registry read is not an error: the response stays 200 with the local facts and a `publishedError`, omitting `channels` / `versions`.
   - `POST /api/dsh-version-update/update` — start one install with `{ "version": "0.1.0-rc.8" }`. A body over 4 KiB answers 413; malformed JSON answers 400.
   - `GET /api/dsh-version-update/status` — read the current (or last) task state, its log, and the staleness facts.
   - `POST /api/dsh-version-update/restart` — hand the port over and restart the host process.
@@ -86,11 +88,11 @@ The composition-layer entry config is validated by a `Config` schema (`@deepseek
 ## Development
 
 ```sh
-npm test          # 99 node:test cases
+npm test          # 107 node:test cases
 npm run typecheck # tsc --checkJs, no build output
 ```
 
-None of the cases need the network or a real install: version ranking and install-target validation, registry-URL normalization, the loopback fence, the npm install task (asserting the shell-free command line and the `--registry` passthrough through a fake spawn), the restart handoff's payload and its port refusals, the four routes exercised over a real HTTP server, the plugin entry's schema and wiring, and the browser-side controller (confirmation, countdown, the reload-surviving watchdog, the not-mounted diagnosis — reached through `createController` with a fake overlay and reload).
+None of the cases need the network or a real install: version ranking and install-target validation, registry-URL normalization, the loopback fence, the npm install task (asserting the shell-free command line and the `--registry` passthrough through a fake spawn, plus the process-wide install slot across fibers), the restart handoff's payload and its port refusals, the four routes exercised over a real HTTP server (including the degraded response when the registry read fails), the plugin entry's schema and wiring, and the browser-side controller (confirmation, countdown, the reload-surviving watchdog, the not-mounted diagnosis — reached through `createController` with a fake overlay and reload). The browser half's mirrored version ranking is pinned by a test that walks both implementations through the same version matrix.
 
 `tsconfig.json` type-checks only and emits nothing: `checkJs` makes the JSDoc the sources already carry into real constraints. `lib/client.js` and the tests are out of scope (the former's `require` belongs to `window.__ModuleLoader__` rather than Node; the latter are built almost entirely from deliberately partial fakes).
 
@@ -101,9 +103,9 @@ None of the cases need the network or a real install: version ranking and instal
 - npm is spawned without a shell on every platform: the runner resolves npm's own `npm-cli.js` next to the running node binary and runs `node npm-cli.js install -g …`, so the version argument never reaches a command-line parser.
 - The configured `registry` is validated as an absolute http(s) URL at mount time before it may appear on that command line, so a value posing as another flag (`--proxy=…`) never gets there.
 - Request bodies are capped at 4 KiB (the update body is one small JSON object).
-- The update button is never one click: the panel shows a confirmation card stating the impact first.
+- The update button is never one click: the panel shows a confirmation card stating the impact first — and when the target is older than what is installed, the card and the button both say *downgrade*.
 - The restart only replays the host's own `process.argv`; no command, argument, or path from a request body is accepted.
-- One install task at a time; a second request while one runs returns 409 rather than queueing (two concurrent global installs would race over the same directory).
+- One install task at a time, enforced PROCESS-WIDE: after a config change hot-reloads the plugin's fiber, the replacement runner still refuses to start while the previous fiber's npm writes the global tree — until that run settles on its own (409 rather than queued; two concurrent global installs would race over the same directory).
 - A single install times out after 10 minutes; unloading the plugin does not interrupt an install in progress (killing npm midway can leave a half-written global package directory).
 
 ## Known limitations

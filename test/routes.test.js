@@ -121,18 +121,44 @@ test('check reports the installed version, channels, and the task view', async (
     assert.equal(body.result.installDir, process.cwd())
     assert.equal(body.result.task.running, '0.1.0-rc.7')
     assert.equal(body.result.task.restartable, false)
+    assert.equal('publishedError' in body.result, false, 'a clean read carries no degradation marker')
   })
 })
 
-test('check reports a failed registry read as a server error', async () => {
+test('check reports a failed registry read as degraded local facts', async () => {
+  // An offline machine still has an installed version and an install path;
+  // burying them behind the registry failure would empty the panel for what
+  // is a network problem, not a host problem. The failure travels as
+  // `publishedError`, and the version lists are simply absent.
   await serving({
     updater: fakeUpdater(),
     fence: () => true,
+    running: '0.1.0',
+    installDir: process.cwd(),
     fetchImpl: async () => ({ ok: false, status: 503 }),
   }, async (base) => {
     const { status, body } = await call(base + PATHS.check)
-    assert.equal(status, 500)
-    assert.match(body.error, /HTTP 503/)
+    assert.equal(status, 200)
+    assert.equal(typeof body.result.installed, 'string', 'the local version survives')
+    assert.equal(body.result.installDir, process.cwd())
+    assert.match(body.result.publishedError, /HTTP 503/)
+    assert.equal('channels' in body.result, false)
+    assert.equal('versions' in body.result, false)
+    assert.equal(body.result.task.running, '0.1.0', 'the task view still rides along')
+  })
+})
+
+test('check degrades identically when the registry is unreachable', async () => {
+  await serving({
+    updater: fakeUpdater(),
+    fence: () => true,
+    installDir: process.cwd(),
+    fetchImpl: async () => { throw new TypeError('fetch failed') },
+  }, async (base) => {
+    const { status, body } = await call(base + PATHS.check)
+    assert.equal(status, 200)
+    assert.equal(body.result.publishedError, 'fetch failed')
+    assert.equal(typeof body.result.installed, 'string')
   })
 })
 

@@ -3,6 +3,36 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its four routes, and the settings page it renders.
 
+## [Unreleased]
+
+### Added
+
+- **A downgrade is named a downgrade.** The version list always allowed
+  installing an older release (that is what a rollback is), but the button and
+  the confirmation card called it an update like any other. When the target
+  ranks below the installed version, the channel row, the target button, and
+  all three parts of the confirmation card now say 降级 / *downgrade*. The
+  browser half ranks versions through its own mirror of the host's comparator,
+  and a test walks both implementations through the same version matrix so the
+  two copies cannot silently disagree.
+- **`check` degrades to local facts when the registry read fails.** The route
+  used to fail outright (HTTP 500) when npm's registry was unreachable,
+  hiding the installed version and install path behind what is a network
+  problem. It now answers 200 with those local facts plus a `publishedError`
+  reason and no `channels` / `versions`; the panel shows a warning beside them
+  instead of flipping into its error state.
+- **The single install slot is now process-wide.** A config change reloads
+  this plugin's fiber, and disposal deliberately leaves a running npm alive —
+  but the replacement runner used to see only its own fresh idle state, so a
+  second click after a reload would spawn a second npm while the first still
+  wrote the global tree. The slot now lives in module state: every runner in
+  this process refuses until the orphaned run settles, which its surviving
+  close listener still reports.
+- Also fixed on the way: the "全部已发布版本" card's primary button referenced
+  an undefined dictionary key (`updateTo`) and rendered that literal string;
+  both dictionaries now carry proper copy (`更新到 {version}` / *Update to
+  {version}*).
+
 ## [0.3.0]
 
 Numbered above the published `0.2.1` rather than above `main`'s stale `0.1.1`

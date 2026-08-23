@@ -34,6 +34,10 @@ class FakeChild extends EventEmitter {
  *
  * A started task holds the install-timeout timer, which keeps the event loop
  * alive for the full ceiling, so every runner is disposed when its test ends.
+ * The install slot those runners claim is PROCESS-WIDE module state, so the
+ * cleanup also settles every fake child — emitting close on an
+ * already-settled run is a no-op — or one test's orphaned npm would hold the
+ * slot into every later test in this file.
  * @param {import('node:test').TestContext} t - the test context, for cleanup.
  * @param {{ timeoutMs?: number }} [options] - runner options.
  * @returns {{ updater: object; calls: object[]; children: FakeChild[] }} the harness.
@@ -52,7 +56,10 @@ function harness(t, options = {}) {
       return child
     },
   })
-  t.after(() => { updater.dispose() })
+  t.after(() => {
+    for (const child of children) child.emit('close', 0)
+    updater.dispose()
+  })
   return { updater, calls, children }
 }
 
@@ -106,6 +113,43 @@ test('only one install runs at a time', (t) => {
   updater.start('0.1.0')
   assert.throws(() => updater.start('0.2.0'), /already running/)
   assert.equal(calls.length, 1)
+})
+
+test('a runner refuses to start while another runner of this process is still installing', (t) => {
+  // The single slot is process-wide, not per runner: a config reload replaces
+  // this plugin's fiber with a fresh runner whose own task state is idle, and
+  // only module-level state can tell it that an earlier fiber's npm is still
+  // writing the global tree.
+  const first = harness(t)
+  const second = harness(t)
+  first.updater.start('0.1.0')
+  assert.throws(() => second.updater.start('0.2.0'), /already running in this host process/)
+  assert.equal(second.calls.length, 0, 'the refused runner spawned nothing')
+})
+
+test('the process-wide slot frees once the earlier run settles', (t) => {
+  const first = harness(t)
+  const second = harness(t)
+  first.updater.start('0.1.0')
+  first.children[0].emit('close', 0)
+  second.updater.start('0.2.0')
+  assert.equal(second.calls.length, 1)
+})
+
+test('disposing a runner does not free the slot its npm still holds', (t) => {
+  // Disposal deliberately leaves npm alive; losing the progress view is
+  // cheaper than a half-written global tree, and so is refusing the next
+  // start until that orphaned run settles — which its surviving close
+  // listener still reports even though the runner instance is gone.
+  const first = harness(t)
+  const second = harness(t)
+  first.updater.start('0.1.0')
+  first.updater.dispose()
+  assert.throws(() => second.updater.start('0.2.0'), /already running/)
+  assert.equal(second.calls.length, 0)
+  first.children[0].emit('close', 1)
+  second.updater.start('0.2.0')
+  assert.equal(second.calls.length, 1, 'the freed slot accepts the next install')
 })
 
 test('a settled task can be started again', (t) => {
