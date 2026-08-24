@@ -1,4 +1,7 @@
 node_modules/
+# `npm install` is run with an in-tree cache during development because the
+# default one is not always writable; the cache is build output, not source.
+.npm-cache/
 *.log
 .DS_Store
 # Scratch verification scripts and probes are written next to the plugin during

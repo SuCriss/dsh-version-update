@@ -5,10 +5,22 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync } from 'node:fs'
-import { test } from 'node:test'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { after, test } from 'node:test'
 
-import { RELAUNCH_SCRIPT, createRestarter, resolveLauncher } from '../lib/restarter.js'
+import { RELAUNCH_SCRIPT, createRestarter, parseRequestedPort, resolveLauncher } from '../lib/restarter.js'
+
+/**
+ * Temp directories the restarter created for its payloads. The real relauncher
+ * consumes and deletes them; these tests never run it, so the suite removes
+ * them itself rather than leaving payload files behind in the temp directory.
+ */
+const payloadDirs = new Set()
+
+after(() => {
+  for (const dir of payloadDirs) rmSync(dir, { recursive: true, force: true })
+})
 
 /**
  * Build a restarter over fake spawn/exit seams.
@@ -23,11 +35,12 @@ function harness(overrides = {}) {
     cwd: '/work',
     execPath: '/usr/bin/node',
     pid: 4242,
-    address: () => ({ host: '127.0.0.1', port: 5173 }),
+    address: () => ({ host: '127.0.0.1', port: 5173, requestedPort: 5173 }),
     delayMs: 1,
     exit: code => { exits.push(code) },
     spawnImpl: (command, args, options) => {
       calls.push({ command, args, options })
+      if (typeof args[1] === 'string') payloadDirs.add(dirname(args[1]))
       return { unref: () => {} }
     },
     ...overrides,
@@ -37,6 +50,21 @@ function harness(overrides = {}) {
 
 test('the shipped relauncher exists beside the restarter', () => {
   assert.ok(existsSync(RELAUNCH_SCRIPT), RELAUNCH_SCRIPT)
+})
+
+test('parseRequestedPort reads the port this invocation asked for', () => {
+  assert.equal(parseRequestedPort(['node', 'bin.js', '--port', '8080']), 8080)
+  assert.equal(parseRequestedPort(['node', 'bin.js', '--port=8080']), 8080)
+  assert.equal(parseRequestedPort(['node', 'bin.js', '--profile', 'web', '--port', '0']), 0)
+  assert.equal(parseRequestedPort(['node', 'bin.js', '--port=0']), 0)
+})
+
+test('parseRequestedPort reports an absent or unusable flag as unknown', () => {
+  assert.equal(parseRequestedPort(['node', 'bin.js', '--profile', 'web']), undefined)
+  assert.equal(parseRequestedPort(['node', 'bin.js', '--port']), undefined)
+  assert.equal(parseRequestedPort(['node', 'bin.js', '--port', 'auto']), undefined)
+  // `--port` as a value of some other flag must not be read as our flag.
+  assert.equal(parseRequestedPort([]), undefined)
 })
 
 test('resolveLauncher uses argv[1] when it is a dsh launcher', () => {
@@ -105,9 +133,31 @@ test('restart refuses when the listening address is unknown', () => {
 test('restart refuses an OS-assigned port', () => {
   // The replacement would bind a different port and the panel could never find
   // it again, so this must fail loudly instead of stranding the user.
-  const { restarter, calls } = harness({ address: () => ({ host: '127.0.0.1', port: 0 }) })
+  const { restarter, calls } = harness({ address: () => ({ host: '127.0.0.1', port: 0, requestedPort: 0 }) })
   assert.throws(() => restarter.restart(), /OS-assigned port/)
   assert.equal(calls.length, 0)
+})
+
+test('restart judges the port the invocation asked for, not the one it got', () => {
+  // The regression this guards: `webServer.port` is the RESOLVED port, so a
+  // host started with `--port 0` is listening on a real number. Judging that
+  // number would arm a handoff whose replacement binds somewhere else, exit
+  // this process, and leave the page polling an address nothing answers on.
+  const { restarter, calls } = harness({
+    argv: ['/usr/bin/node', '/opt/dsh/lib/bin.js', '--profile', 'web', '--port', '0'],
+    address: () => ({ host: '127.0.0.1', port: 54321, requestedPort: 0 }),
+  })
+  assert.throws(() => restarter.restart(), /OS-assigned port/)
+  assert.equal(calls.length, 0, 'nothing was spawned and this host stays alive')
+})
+
+test('restart accepts a fixed port even without an explicit requestedPort', () => {
+  // An embedder that reports only the bound address still gets a restart when
+  // that address is a real, reproducible port.
+  const { restarter, calls } = harness({ address: () => ({ host: '127.0.0.1', port: 3080 }) })
+  const result = restarter.restart()
+  assert.equal(result.port, 3080)
+  assert.equal(calls.length, 1)
 })
 
 test('restart refuses when the launcher entry cannot be resolved', () => {

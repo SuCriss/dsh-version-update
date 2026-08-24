@@ -13,10 +13,16 @@ import { test } from 'node:test'
 import {
   buildView,
   compareVersions,
+  createNotesReader,
+  evaluateAutoCheck,
   fetchPublished,
+  fetchReleaseNotes,
   isInstallableVersion,
+  normalizeRegistry,
   parseVersion,
   readInstalled,
+  readRepository,
+  repositorySlug,
   resolveInstallationDir,
 } from '../lib/core.js'
 
@@ -98,6 +104,31 @@ test('readInstalled reports the directory alone when the manifest is unusable', 
   assert.deepEqual(readInstalled(bom), { dir: bom }, 'manifest without a version')
 })
 
+test('normalizeRegistry accepts http(s) origins and strips trailing slashes', () => {
+  assert.equal(normalizeRegistry('https://registry.npmjs.org'), 'https://registry.npmjs.org')
+  assert.equal(normalizeRegistry('https://registry.npmjs.org/'), 'https://registry.npmjs.org')
+  assert.equal(normalizeRegistry('https://npm.example.com/mirror///'), 'https://npm.example.com/mirror')
+  assert.equal(normalizeRegistry('http://localhost:4873'), 'http://localhost:4873')
+})
+
+test('normalizeRegistry refuses anything that is not an absolute http(s) URL', () => {
+  // The value reaches an `npm --registry` argument, so a non-URL — and above
+  // all something that could read as another flag — must never get that far.
+  for (const bad of [
+    '', '   ', 'registry.npmjs.org', '//registry.npmjs.org', 'file:///etc/passwd',
+    'ftp://mirror/', 'javascript:alert(1)', '--proxy=http://evil', 42, null, {},
+  ]) {
+    assert.throws(() => normalizeRegistry(bad), /registry must/, String(bad))
+  }
+})
+
+test('fetchPublished refuses a registry that is not a usable URL', async () => {
+  await assert.rejects(
+    fetchPublished({ registry: 'not a url', fetchImpl: async () => { throw new Error('unreachable') } }),
+    /registry must/,
+  )
+})
+
 test('fetchPublished returns dist-tags and versions newest first', async () => {
   let seen
   const published = await fetchPublished({
@@ -155,4 +186,81 @@ test('buildView claims nothing is ahead when the installed version is unknown', 
   const view = buildView({ distTags: { latest: '9.9.9' }, versions: ['9.9.9'] })
   assert.equal('installed' in view, false)
   assert.deepEqual(view.channels, [{ channel: 'latest', version: '9.9.9', ahead: false }])
+})
+
+test('repositorySlug reads the manifest shapes npm actually carries', () => {
+  // dsh's own shape: a monorepo object URL with git+ and .git decoration.
+  assert.equal(repositorySlug({ type: 'git', url: 'git+https://github.com/deepseek-ai/deepseek-harness.git' }), 'deepseek-ai/deepseek-harness')
+  assert.equal(repositorySlug('git+ssh://git@github.com:deepseek-ai/dsh.git'), 'deepseek-ai/dsh')
+  assert.equal(repositorySlug('https://github.com/owner/repo'), 'owner/repo')
+  assert.equal(repositorySlug('https://github.com/owner/repo/tree/main/packages/x#readme'), 'owner/repo')
+  for (const bad of [undefined, null, 5, '', 'https://gitlab.com/o/r', { type: 'git' }]) {
+    assert.equal(repositorySlug(bad), undefined, String(bad === '' ? '<empty>' : String(bad)))
+  }
+})
+
+test('fetchReleaseNotes tries the dsh tag convention before the plain one', async () => {
+  const seen = []
+  const result = await fetchReleaseNotes({
+    repo: 'deepseek-ai/deepseek-harness',
+    version: '0.1.1-rc.2',
+    tags: ['dsh-v0.1.1-rc.2', 'v0.1.1-rc.2'],
+    fetchImpl: async (url) => {
+      seen.push(url)
+      if (!url.includes('dsh-v')) return { ok: false, status: 404 }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ body: '# notes', html_url: 'https://github.com/x/releases/tag/dsh-v0.1.1-rc.2' }),
+      }
+    },
+  })
+  assert.equal(seen.length, 1, 'the first candidate matching ends the walk')
+  assert.equal(result.notes, '# notes')
+  assert.equal(result.url, 'https://github.com/x/releases/tag/dsh-v0.1.1-rc.2')
+})
+
+test('a version without any release is an empty answer, not an error', async () => {
+  const result = await fetchReleaseNotes({
+    repo: 'o/r',
+    version: '9.9.9',
+    fetchImpl: async () => ({ ok: false, status: 404 }),
+  })
+  assert.deepEqual(result, {})
+})
+
+test('an upstream GitHub failure surfaces as a thrown error', async () => {
+  await assert.rejects(
+    () => fetchReleaseNotes({ repo: 'o/r', version: '1.0.0', fetchImpl: async () => ({ ok: false, status: 403 }) }),
+    /HTTP 403/,
+  )
+})
+
+test('createNotesReader caches both hits and misses per version', async () => {
+  let now = 0
+  let reads = 0
+  const reader = createNotesReader({
+    ttlMs: 1000,
+    now: () => now,
+    fetchImpl: async () => {
+      reads += 1
+      return { ok: true, status: 200, json: async () => ({ body: `body ${String(reads)}`, html_url: 'u' }) }
+    },
+  })
+  assert.equal((await reader('o/r', '1.0.0')).notes, 'body 1')
+  await reader('o/r', '2.0.0')
+  assert.equal((await reader('o/r', '1.0.0')).notes, 'body 1', 'the cached body answers within the TTL')
+  assert.equal(reads, 2)
+  now = 2000
+  assert.equal((await reader('o/r', '1.0.0')).notes, 'body 3', 'past the TTL the entry is re-read')
+  assert.equal(reads, 3)
+})
+
+test('evaluateAutoCheck compares latest against installed and stays silent when uncomparable', () => {
+  assert.deepEqual(evaluateAutoCheck({ installed: '0.1.0', distTags: { latest: '0.2.0' }, versions: ['0.2.0', '0.1.0'] }), { latest: '0.2.0', updateAvailable: true })
+  assert.deepEqual(evaluateAutoCheck({ installed: '0.2.0', distTags: { latest: '0.2.0' }, versions: ['0.2.0'] }), { latest: '0.2.0', updateAvailable: false })
+  // A host running a pre-release newer than latest is not "behind".
+  assert.equal(evaluateAutoCheck({ installed: '0.3.0-rc.1', distTags: { latest: '0.2.0' }, versions: ['0.2.0'] }).updateAvailable, false)
+  // No installed fact: no claim at all.
+  assert.deepEqual(evaluateAutoCheck({ distTags: {}, versions: ['0.2.0'] }), { latest: '0.2.0', updateAvailable: false })
 })

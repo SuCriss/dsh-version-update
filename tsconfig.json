@@ -1,0 +1,43 @@
+{
+  // The plugin ships plain ESM JavaScript — no build step, no emitted output.
+  // This config exists purely so the JSDoc types the sources already carry are
+  // actually checked: `checkJs` turns every `@param` and `@returns` into a real
+  // constraint, which is the only type safety a no-build plugin can have.
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023", "DOM"],
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true,
+    // Deliberately off: both flags are valuable in a TypeScript codebase, but in
+    // JSDoc-typed JS they mostly demand casts and `?? ''` noise around values the
+    // surrounding validation has already narrowed, which would make the sources
+    // harder to read than the errors are worth.
+    "exactOptionalPropertyTypes": false,
+    "noUncheckedIndexedAccess": false,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  // The host half only. lib/client.js is a hand-written `window.__ModuleLoader__`
+  // factory whose `require` is the loader's rather than Node's, so nothing here
+  // could resolve its imports without inventing declarations for every seeded
+  // module; its behaviour is covered by test/client.test.js. The tests are
+  // likewise excluded — they are built almost entirely from deliberately partial
+  // fakes, and typing those to satisfy the DOM lib would obscure what each one
+  // is asserting.
+  "include": [
+    "lib/core.js",
+    "lib/index.js",
+    "lib/loopback.js",
+    "lib/protocol.js",
+    "lib/relaunch.js",
+    "lib/restarter.js",
+    "lib/routes.js",
+    "lib/updater.js",
+    "types"
+  ],
+  "exclude": ["node_modules"]
+}
