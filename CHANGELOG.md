@@ -3,6 +3,26 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.0.5]
+
+### Fixed
+
+- **A dead primary registry no longer blanks the version list.** The registry
+  read now falls back to a mirror (`registry.npmmirror.com`) when the primary
+  registry fails at the network layer (DNS, connect, TLS, timeout), so a flaky
+  or blocked `registry.npmjs.org` behind a slow link still yields the published
+  versions instead of degrading the panel to a local-only view. A registry that
+  answers with an HTTP error is treated as a real answer and is not bypassed.
+- **The check button no longer shows "checking…" twice.** The loading state now
+  shows one label on the button plus a small spinner, instead of duplicating
+  the text in a second element.
+
+### Changed
+
+- The `check` response now carries `publishedError` as
+  `registry unreachable (tried <registries>): <cause>` when every registry
+  fails, naming each attempted source.
+
 ## [1.0.4]
 
 ### Added

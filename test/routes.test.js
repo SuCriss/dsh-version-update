@@ -140,9 +140,43 @@ test('a failing registry read degrades check instead of failing it', async () =>
   })
   const res = await invoke(routes, VERSION_API.check)
   assert.equal(res.status, 200)
-  assert.equal(res.body.result.publishedError, 'EAI_AGAIN')
+  assert.match(res.body.result.publishedError ?? '', /registry unreachable/)
+  assert.match(res.body.result.publishedError ?? '', /EAI_AGAIN/)
   assert.equal(res.body.result.channels, undefined)
   assert.equal(res.body.result.installed, '0.4.0')
+})
+
+test('a network-layer registry failure falls back to a mirror and still serves the view', async () => {
+  let calls = 0
+  const { routes } = harness({
+    deps: {
+      fetchImpl: async () => {
+        calls += 1
+        if (calls === 1) throw new Error('fetch failed')
+        return {
+          ok: true,
+          json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {}, '0.4.0': {} } }),
+        }
+      },
+    },
+  })
+  const res = await invoke(routes, VERSION_API.check)
+  assert.equal(res.status, 200)
+  assert.equal(calls, 2, 'the primary registry and one mirror were both tried')
+  assert.equal(res.body.result.publishedError, undefined)
+  assert.equal(res.body.result.channels[0].version, '0.5.0')
+})
+
+test('a registry that answers with an HTTP error does not fall back', async () => {
+  const { routes } = harness({
+    deps: {
+      fetchImpl: async () => ({ ok: false, status: 500 }),
+    },
+  })
+  const res = await invoke(routes, VERSION_API.check)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.publishedError, 'registry read failed: HTTP 500')
+  assert.equal(res.body.result.channels, undefined)
 })
 
 test('update validates the target and always records manual trigger', async () => {
