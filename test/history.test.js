@@ -1,82 +1,73 @@
 /**
- * Install-history tests: the on-disk record every settled install appends,
- * its cap, and the rollback target derived from it — including the cases
- * where the derivation must stay silent because a stale target would
- * downgrade past the user's actual history.
+ * History tests: tolerant loading (including entries from the previous plugin
+ * generation), capped appends, and the panel summary shape.
  */
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { test } from 'node:test'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test } from 'node:test'
+import { appendHistory, defaultHistoryPath, loadHistory, summarizeHistory } from '../lib/history.js'
 
-import { HISTORY_MAX, appendHistory, defaultHistoryPath, loadHistory, summarizeHistory } from '../lib/history.js'
-
-/** A fresh history file in a throwaway directory. */
-function file(t) {
-  const dir = mkdtempSync(join(tmpdir(), 'vu-history-'))
-  const path = join(dir, 'history.json')
-  t.after(() => { /* the temp directory outlives the process harmlessly */ })
+function tempPath(t) {
+  const home = mkdtempSync(join(tmpdir(), 'vu-hist-'))
+  const path = defaultHistoryPath({ home })
+  // The seeded files below need the dot-directory to exist already;
+  // appendHistory creates it on its own, raw writes do not.
+  mkdirSync(join(path, '..'), { recursive: true })
+  t.after(() => rmSync(home, { recursive: true, force: true }))
   return path
 }
 
-test('an absent or corrupt history reads as empty', (t) => {
-  const missing = join(tmpdir(), `vu-history-${String(Math.random())}`, 'history.json')
-  assert.deepEqual(loadHistory(missing), [])
-
-  const corrupt = file(t)
-  writeFileSync(corrupt, '{not json', 'utf8')
-  assert.deepEqual(loadHistory(corrupt), [])
+test('defaultHistoryPath lives under the given home', () => {
+  assert.equal(defaultHistoryPath({ home: '/h' }), join('/h', '.dsh-version-update', 'history.json'))
 })
 
-test('entries append oldest first and the file caps itself', (t) => {
-  const path = file(t)
-  for (let index = 0; index < HISTORY_MAX + 10; index += 1) {
-    appendHistory(path, { at: index, from: '0.1.0', to: '0.2.0', result: 'ok' })
+test('append then load round-trips entries with triggers', (t) => {
+  const path = tempPath(t)
+  appendHistory(path, { at: 1, from: '0.1.0', to: '0.2.0', result: 'ok', trigger: 'manual' })
+  appendHistory(path, { at: 2, to: '0.1.0', result: 'ok', restored: true })
+  const entries = loadHistory(path)
+  assert.equal(entries.length, 2)
+  assert.deepEqual(entries[0], { at: 1, from: '0.1.0', to: '0.2.0', result: 'ok', trigger: 'manual' })
+  assert.equal(entries[1].restored, true)
+})
+
+test('legacy entries without a trigger stay valid; junk is dropped', (t) => {
+  const path = tempPath(t)
+  writeFileSync(path, JSON.stringify([
+    { at: 1, from: '0.1.0', to: '0.2.0', result: 'ok' },
+    { at: 2, to: '0.3.0', result: 'ok', trigger: 'auto' },
+    { nonsense: true },
+    { at: 'nope', to: 'x', result: 'ok' },
+    { at: 3, to: 'x', result: 'meh' },
+    'a string',
+    null,
+  ]))
+  const entries = loadHistory(path)
+  assert.equal(entries.length, 2)
+  assert.equal(entries[0].trigger, undefined)
+  assert.equal(entries[1].trigger, 'auto')
+})
+
+test('the file caps at HISTORY_MAX entries, oldest dropped first', async (t) => {
+  const { HISTORY_MAX } = await import('../lib/history.js')
+  const path = tempPath(t)
+  for (let index = 0; index < HISTORY_MAX + 5; index += 1) {
+    appendHistory(path, { at: index, to: `0.0.${index}`, result: 'ok' })
   }
   const entries = loadHistory(path)
   assert.equal(entries.length, HISTORY_MAX)
-  assert.equal(entries[0].at, 10, 'the oldest entries were dropped')
-  // The written form parses back to what loadHistory returns.
-  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), entries)
+  assert.equal(entries[0].at, 5)
+  assert.equal(entries.at(-1)?.at, HISTORY_MAX + 4)
 })
 
-test('the rollback target is the origin of the install that produced the current version', () => {
-  const entries = [
+test('summarizeHistory returns the newest entries first', () => {
+  const summary = summarizeHistory([
     { at: 1, from: '0.1.0', to: '0.2.0', result: 'ok' },
-    { at: 2, from: '0.2.0', to: '0.3.0', result: 'ok' },
-  ]
-  const view = summarizeHistory(entries, '0.3.0')
-  assert.equal(view.rollbackTarget, '0.2.0')
-  assert.equal(view.recent.length, 2)
-})
-
-test('no target is offered when another update has since superseded it', () => {
-  // The last success produced 0.3.0; offering 0.1.0 for a host now on 0.4.0
-  // would skip over real history.
-  const entries = [{ at: 1, from: '0.1.0', to: '0.3.0', result: 'ok' }]
-  assert.equal(summarizeHistory(entries, '0.4.0').rollbackTarget, undefined)
-})
-
-test('a failed install never anchors the rollback offer', () => {
-  // The failed run left no trustworthy "before"; the success before it does
-  // not match the on-disk version either, so there is nothing safe to offer.
-  const entries = [
-    { at: 1, from: '0.1.0', to: '0.2.0', result: 'ok' },
-    { at: 2, from: '0.2.0', to: '0.3.0', result: 'failed' },
-  ]
-  const view = summarizeHistory(entries, '0.3.0')
-  assert.equal(view.rollbackTarget, undefined, 'the failure may have left anything on disk')
-})
-
-test('an unknown installed version offers nothing', () => {
-  const entries = [{ at: 1, from: '0.1.0', to: '0.2.0', result: 'ok' }]
-  assert.equal(summarizeHistory(entries, undefined).rollbackTarget, undefined)
-})
-
-test('the default location lives outside the package that updates replace', () => {
-  // Any install-scoped path would be wiped by the very update being recorded.
-  const home = join('home', 'user')
-  assert.match(defaultHistoryPath({ home }), /^home[/\\]user[/\\]\.dsh-version-update[/\\]history\.json$/)
+    { at: 2, to: '0.3.0', result: 'failed', trigger: 'auto' },
+    { at: 3, to: '0.2.0', result: 'ok', restored: true },
+  ])
+  assert.deepEqual(summary.recent.map(entry => entry.at), [3, 2, 1])
 })

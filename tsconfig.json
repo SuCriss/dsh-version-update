@@ -30,12 +30,16 @@
   // is asserting.
   "include": [
     "lib/core.js",
+    "lib/history.js",
     "lib/index.js",
     "lib/loopback.js",
+    "lib/policy.js",
     "lib/protocol.js",
     "lib/relaunch.js",
     "lib/restarter.js",
     "lib/routes.js",
+    "lib/scheduler.js",
+    "lib/snapshot.js",
     "lib/updater.js",
     "types"
   ],

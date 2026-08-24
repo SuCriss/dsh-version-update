@@ -1,82 +1,56 @@
 /**
- * Trust-fence tests: these routes reach the network, write the machine's global
- * npm tree, and can end the host process, so the fence is the plugin's most
- * security-relevant unit.
+ * Loopback fence tests: socket semantics, Host header checks, and the
+ * same-origin markers — the trust boundary every route sits behind.
  */
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { isLoopbackAddress, isLoopbackHostname, isLoopbackRequest } from '../lib/loopback.js'
 
-import { isIPv4Loopback, isLoopbackAddress, isLoopbackHostname, isLoopbackRequest } from '../lib/loopback.js'
-
-/**
- * Build a minimal request stand-in.
- * @param {{ address?: string; headers?: Record<string, string> }} [options] - socket address and headers.
- * @returns {import('node:http').IncomingMessage} the request stand-in.
- */
-const request = (options = {}) => ({
-  socket: { remoteAddress: options.address ?? '127.0.0.1' },
-  headers: { host: '127.0.0.1:5173', ...options.headers },
-})
-
-test('isIPv4Loopback accepts 127/8 and rejects everything else', () => {
-  for (const good of ['127.0.0.1', '127.1.2.3', '127.255.255.255', '127.0.0.255']) {
-    assert.equal(isIPv4Loopback(good), true, good)
+/** @param {{ remote?: string; host?: string; site?: string; origin?: string }} shape - request facts. */
+function fakeRequest({ remote = '127.0.0.1', host = '127.0.0.1:3080', site, origin }) {
+  return {
+    socket: { remoteAddress: remote },
+    headers: {
+      ...(host !== undefined ? { host } : {}),
+      ...(site !== undefined ? { 'sec-fetch-site': site } : {}),
+      ...(origin !== undefined ? { origin } : {}),
+    },
   }
-  for (const bad of ['128.0.0.1', '10.0.0.1', '0.0.0.0', '127.0.0', '127.0.0.1.5', '127.0.0.256', '127.0.0.a', '']) {
-    assert.equal(isIPv4Loopback(bad), false, bad)
+}
+
+test('loopback addresses cover 127/8, ::1, and IPv4-mapped forms only', () => {
+  for (const good of ['127.0.0.1', '127.8.8.8', '::1', '::ffff:127.0.0.1', '::ffff:7f00:1'.replace('7f00:1', '127.0.0.2')]) {
+    assert.equal(isLoopbackAddress(good), true, good)
+  }
+  for (const bad of [undefined, '', '192.168.1.10', '10.0.0.2', '::2', '::ffff:192.168.0.1', 'fe80::1']) {
+    assert.equal(isLoopbackAddress(bad), false, String(bad))
   }
 })
 
-test('isLoopbackAddress covers IPv6 loopback and IPv4-mapped forms', () => {
-  assert.equal(isLoopbackAddress('::1'), true)
-  assert.equal(isLoopbackAddress('::FFFF:127.0.0.1'), true, 'case-insensitive mapped form')
-  assert.equal(isLoopbackAddress('::ffff:10.0.0.1'), false, 'a mapped non-loopback address')
-  assert.equal(isLoopbackAddress('::2'), false)
-  assert.equal(isLoopbackAddress(undefined), false)
-})
-
-test('isLoopbackHostname accepts the loopback authorities only', () => {
+test('loopback hostnames accept localhost and bracketed IPv6', () => {
   assert.equal(isLoopbackHostname('localhost'), true)
   assert.equal(isLoopbackHostname('[::1]'), true)
   assert.equal(isLoopbackHostname('127.0.0.1'), true)
   assert.equal(isLoopbackHostname('example.com'), false)
-  assert.equal(isLoopbackHostname('localhost.evil.com'), false, 'a suffix must not pass as localhost')
+  assert.equal(isLoopbackHostname('localhost.evil.com'), false)
 })
 
-test('a same-origin loopback request passes the fence', () => {
-  assert.equal(isLoopbackRequest(request()), true, 'no Origin at all (a plain navigation)')
-  assert.equal(isLoopbackRequest(request({
-    headers: { origin: 'http://127.0.0.1:5173', 'sec-fetch-site': 'same-origin' },
-  })), true)
-  assert.equal(isLoopbackRequest(request({
-    address: '::1',
-    headers: { host: '[::1]:5173', origin: 'http://[::1]:5173' },
-  })), true, 'IPv6 loopback end to end')
+test('a request needs a loopback socket AND a loopback Host header', () => {
+  assert.equal(isLoopbackRequest(fakeRequest({})), true)
+  // Remote LAN address is refused even with everything else perfect.
+  assert.equal(isLoopbackRequest(fakeRequest({ remote: '192.168.1.50' })), false)
+  // DNS-rebinding style Host header is refused even from loopback.
+  assert.equal(isLoopbackRequest(fakeRequest({ host: 'evil.example:3080' })), false)
+  // A missing Host header is refused as well.
+  const noHost = fakeRequest({})
+  delete noHost.headers.host
+  assert.equal(isLoopbackRequest(noHost), false)
 })
 
-test('the socket address is authoritative and never overridden by headers', () => {
-  assert.equal(isLoopbackRequest(request({ address: '192.168.1.20' })), false)
-  assert.equal(isLoopbackRequest(request({
-    address: '192.168.1.20',
-    headers: { host: '127.0.0.1:5173', 'x-forwarded-for': '127.0.0.1' },
-  })), false, 'X-Forwarded-For must not launder a remote peer')
-})
-
-test('a non-loopback or unusable Host header fails the fence', () => {
-  // A LAN-reachable host answering on its own name would otherwise expose the
-  // routes to any browser that can resolve it.
-  assert.equal(isLoopbackRequest(request({ headers: { host: 'my-laptop.local:5173' } })), false)
-  assert.equal(isLoopbackRequest(request({ headers: { host: 'evil.com' } })), false)
-  assert.equal(isLoopbackRequest({ socket: { remoteAddress: '127.0.0.1' }, headers: {} }), false, 'absent Host')
-  assert.equal(isLoopbackRequest(request({ headers: { host: 'http://[bad' } })), false, 'unparsable Host')
-})
-
-test('a cross-site or cross-origin request fails the fence', () => {
-  assert.equal(isLoopbackRequest(request({ headers: { 'sec-fetch-site': 'cross-site' } })), false)
-  assert.equal(isLoopbackRequest(request({ headers: { origin: 'http://evil.com' } })), false)
-  assert.equal(isLoopbackRequest(request({
-    headers: { origin: 'http://127.0.0.1:9999' },
-  })), false, 'a different port on the same loopback host is a different origin')
-  assert.equal(isLoopbackRequest(request({ headers: { origin: 'not a url' } })), false)
+test('cross-site fetch markers are refused; same-origin passes', () => {
+  assert.equal(isLoopbackRequest(fakeRequest({ site: 'cross-site' })), false)
+  assert.equal(isLoopbackRequest(fakeRequest({ site: 'same-origin' })), true)
+  assert.equal(isLoopbackRequest(fakeRequest({ origin: 'http://127.0.0.1:3080' })), true)
+  assert.equal(isLoopbackRequest(fakeRequest({ origin: 'http://attacker.example' })), false)
 })

@@ -1,7 +1,7 @@
 {
   "name": "dsh-version-update",
-  "description": "Version update menu for the dsh Web GUI settings panel: report the installed @deepseek-ai/dsh version against the npm latest/next channels, install a chosen version with one click, then restart the host and reload the page automatically.",
-  "version": "0.4.0",
+  "description": "Version management for the dsh Web GUI settings panel: inspect the installed @deepseek-ai/dsh against every npm channel or version line, install or downgrade with one click, roll back instantly from local snapshots, automate the whole cycle with a policy engine (silent auto-update, execution windows, daily checks), and restart the host seamlessly.",
+  "version": "1.0.0",
   "type": "module",
   "author": "SuCriss",
   "license": "Apache-2.0",
@@ -19,14 +19,15 @@
     "deepseek-harness",
     "settings",
     "update",
-    "self-update"
+    "self-update",
+    "rollback"
   ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },
   "main": "lib/index.js",
   "scripts": {
-    "test": "node --test test/core.test.js test/history.test.js test/loopback.test.js test/updater.test.js test/restarter.test.js test/routes.test.js test/index.test.js test/client.test.js",
+    "test": "node --test test/protocol.test.js test/core.test.js test/policy.test.js test/snapshot.test.js test/history.test.js test/loopback.test.js test/updater.test.js test/scheduler.test.js test/restarter.test.js test/routes.test.js test/index.test.js test/client.test.js",
     "typecheck": "tsc -p tsconfig.json"
   },
   "exports": {

@@ -1,213 +1,173 @@
 /**
- * Plugin-entry tests: the config schema cordis validates before this plugin
- * starts, the announcement's placement in the system prompt, and the wiring
- * `apply` performs over a fake context — above all that the restart guard is
- * fed the port the invocation asked for rather than the one it was given.
+ * Composition tests: what apply() mounts, what it persists, and the local
+ * behavior of its routes against a fake host context. The network-facing
+ * pieces (registry, npm, GitHub) are exercised in their own module tests.
  */
 
 import assert from 'node:assert/strict'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
-
-import { Config, VERSION_UPDATE_GUIDANCE, apply, inject, name } from '../lib/index.js'
-import { readRepository, resolveInstallationDir } from '../lib/core.js'
+import { VERSION_API, DEFAULT_POLICY } from '../lib/protocol.js'
+import { apply } from '../lib/index.js'
 
 /**
- * A cordis context stand-in recording what the plugin registers on it.
- * @param {object} [options] - the fake host's shape.
- * @returns {object} the context plus its recordings.
+ * A fake cordis context recording route registrations and effects. `register`
+ * rejects a duplicate (kind, path) exactly like the real web server does: the
+ * route table is keyed by pattern alone, so a family mounting one path twice
+ * is a boot failure, not a runtime detail this fake may smooth over.
  */
-function fakeContext(options = {}) {
+function fakeCtx() {
   const registered = []
-  const sections = []
   const effects = []
-  const ctx = {
+  return {
+    registered,
+    effects,
     webServer: {
-      host: options.host ?? '127.0.0.1',
-      port: options.port ?? 3080,
-      register: (route) => {
+      host: '127.0.0.1',
+      port: 3080,
+      register(route) {
+        const clash = registered.find(entry => entry.kind === route.kind && entry.path === route.path)
+        if (clash !== undefined) throw new Error(`webserver: duplicate ${route.kind} route "${route.path}"`)
         registered.push(route)
-        return () => {}
+        return () => {
+          const index = registered.indexOf(route)
+          if (index >= 0) registered.splice(index, 1)
+        }
       },
     },
-    get: (service) => (service === 'systemPrompt' && options.systemPrompt !== false
-      ? { section: (s) => { sections.push(s); return () => {} } }
-      : undefined),
-    effect: (fn, label) => {
-      effects.push(label)
+    effect(fn) {
       const dispose = fn()
-      return typeof dispose === 'function' ? dispose : () => {}
+      effects.push(dispose)
     },
   }
-  return { ctx, registered, sections, effects }
 }
 
-test('the plugin declares a stable name and its one hard dependency', () => {
-  assert.equal(name, 'version-update')
-  assert.deepEqual(inject, ['webServer'])
-})
-
-test('Config fills every field so apply never reads an absent option', () => {
-  assert.deepEqual(Config({}), {
-    announceToAgent: true,
-    registry: 'https://registry.npmjs.org',
-    allowRestart: true,
-    releaseNotes: true,
-    autoCheckIntervalHours: 0,
-    autoRollbackOnFailedRestart: false,
+/** One fake installed dsh + fake argv + temp data dir; restores everything after. */
+function environment(t, manifestVersion = '0.4.0') {
+  const installDir = mkdtempSync(join(tmpdir(), 'vu-idx-install-'))
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({
+    name: '@deepseek-ai/dsh',
+    version: manifestVersion,
+  }))
+  const dataDir = mkdtempSync(join(tmpdir(), 'vu-idx-data-'))
+  const savedArgv = process.argv
+  process.argv = [process.execPath, join(installDir, 'lib', 'bin.js'), '--profile', 'web']
+  t.after(() => {
+    process.argv = savedArgv
+    rmSync(installDir, { recursive: true, force: true })
+    rmSync(dataDir, { recursive: true, force: true })
   })
-})
+  return { installDir, dataDir }
+}
 
-test('Config rejects a mistyped entry instead of silently disabling a feature', () => {
-  // The point of declaring a schema: a typo in a profile's patch layer fails
-  // the load with a named path rather than turning a feature off in silence.
-  assert.throws(() => Config({ announceToAgent: 'yes' }), /announceToAgent/)
-  assert.throws(() => Config({ registry: 5 }), /registry/)
-  assert.throws(() => Config({ allowRestart: 1 }), /allowRestart/)
-  assert.throws(() => Config({ releaseNotes: 'no' }), /releaseNotes/)
-  assert.throws(() => Config({ autoCheckIntervalHours: 'daily' }), /autoCheckIntervalHours/)
-  assert.throws(() => Config({ autoRollbackOnFailedRestart: 3 }), /autoRollbackOnFailedRestart/)
-})
-
-test('Config serializes for the settings inventory', () => {
-  // schemastery flattens to a ref table: the root's dict maps each key to a uid
-  // in `refs`. The settings panel renders a form from that, so every field has
-  // to survive the flattening with its type and description intact.
-  const json = Config.toJSON()
-  const root = json.refs[String(json.uid)]
-  assert.equal(root.type, 'object')
-  assert.deepEqual(Object.keys(root.dict).sort(), [
-    'allowRestart', 'announceToAgent', 'autoCheckIntervalHours', 'autoRollbackOnFailedRestart', 'registry', 'releaseNotes',
-  ])
-  for (const [key, uid] of Object.entries(root.dict)) {
-    const field = json.refs[String(uid)]
-    assert.ok(field !== undefined, key)
-    const want = key === 'registry' ? 'string' : key === 'autoCheckIntervalHours' ? 'number' : 'boolean'
-    assert.equal(field.type, want, key)
-    assert.equal(typeof field.meta.description, 'string', key)
-  }
-})
-
-test('apply registers the base routes and the announcement', () => {
-  // With release notes disabled the composition mounts exactly the four core
-  // routes regardless of what the installed manifest names.
-  const { ctx, registered, sections } = fakeContext()
-  apply(ctx, Config({ releaseNotes: false }))
-
-  assert.deepEqual(registered.map(route => route.path).sort(), [
-    '/api/dsh-version-update/check',
-    '/api/dsh-version-update/restart',
-    '/api/dsh-version-update/status',
-    '/api/dsh-version-update/update',
-  ])
-  assert.equal(sections.length, 1)
-  assert.equal(sections[0].name, 'plugin:dsh-version-update')
-  assert.equal(sections[0].text, VERSION_UPDATE_GUIDANCE)
-})
-
-test('release notes mount exactly when the installed manifest names a repository', () => {
-  // The fifth route is conditional by design: no repository in the manifest,
-  // nothing to read notes from. The expectation is derived from the same
-  // resolution apply performs, so this test is portable across environments
-  // with and without an installed dsh.
-  const { ctx, registered } = fakeContext()
-  apply(ctx, Config({}))
-  const expected = readRepository(resolveInstallationDir()) !== undefined ? 5 : 4
-  assert.equal(registered.length, expected)
-  assert.equal(registered.some(route => route.path.endsWith('/notes')), expected === 5)
-})
-
-test('the announcement sits inside the tool-guidance band', () => {
-  // Bands are a shared convention: identity at -100, persona at 0, tool
-  // guidance at 100-199. An order past the band would outrank first-party
-  // guidance that has to be read first.
-  const { ctx, sections } = fakeContext()
-  apply(ctx, Config({}))
-  assert.ok(sections[0].order >= 100 && sections[0].order < 200, String(sections[0].order))
-})
-
-test('announceToAgent false serves the routes without touching the prompt', () => {
-  const { ctx, registered, sections } = fakeContext()
-  apply(ctx, Config({ announceToAgent: false, releaseNotes: false }))
-  assert.equal(registered.length, 4)
-  assert.deepEqual(sections, [])
-})
-
-test('a host without a system prompt still serves the routes', () => {
-  // Headless RPC compositions have no systemPrompt service.
-  const { ctx, registered } = fakeContext({ systemPrompt: false })
-  apply(ctx, Config({ releaseNotes: false }))
-  assert.equal(registered.length, 4)
-})
-
-test('allowRestart false makes the restart route report itself unavailable', async () => {
-  const { ctx, registered } = fakeContext()
-  apply(ctx, Config({ allowRestart: false }))
-  const status = registered.find(route => route.path.endsWith('/status'))
-  const body = await invoke(status, 'GET')
-  assert.equal(body.result.restartable, false)
-})
-
-test('the restarter judges the requested port, not the resolved one', async () => {
-  // The regression: under `--port 0` the host holds a real, OS-assigned port,
-  // so a guard reading `webServer.port` would arm a handoff whose replacement
-  // binds elsewhere — after this process has already exited.
-  const argv = process.argv
-  try {
-    process.argv = [argv[0], argv[1], '--profile', 'web', '--port', '0']
-    const { ctx, registered } = fakeContext({ port: 54321 })
-    apply(ctx, Config({}))
-    const restart = registered.find(route => route.path.endsWith('/restart'))
-    const { status, body } = await invoke(restart, 'POST', true)
-    assert.equal(status, 409)
-    assert.match(body.error, /OS-assigned port/)
-  } finally {
-    process.argv = argv
-  }
-})
-
-test('a fixed --port leaves the restart route armed', async () => {
-  const argv = process.argv
-  try {
-    process.argv = [argv[0], argv[1], '--port', '3080']
-    const { ctx, registered } = fakeContext({ port: 3080 })
-    apply(ctx, Config({}))
-    const status = registered.find(route => route.path.endsWith('/status'))
-    const body = await invoke(status, 'GET')
-    assert.equal(body.result.restartable, true)
-  } finally {
-    process.argv = argv
-  }
-})
-
-test('an unparsable registry fails the mount instead of reaching npm', () => {
-  // Config only proves it is a string; the URL shape is checked here because the
-  // value becomes an `npm --registry` argument.
-  const { ctx } = fakeContext()
-  assert.throws(() => apply(ctx, Config({ registry: 'not a url' })), /registry must/)
-})
-
-/**
- * Drive one route handler through fake req/res objects.
- * @param {object} route - the registered route.
- * @param {'GET' | 'POST'} method - the request method.
- * @param {boolean} [withStatus] - resolve to status plus body instead of body alone.
- * @returns {Promise<any>} the parsed response.
- */
-async function invoke(route, method, withStatus = false) {
-  let code
-  let payload = ''
+async function invoke(routes, path, opts = {}) {
+  const method = opts.method ?? 'GET'
+  const route = routes.find(candidate => candidate.path === path)
+  assert.ok(route !== undefined, `route ${path} mounted`)
+  const chunks = opts.body === undefined ? [] : [Buffer.from(JSON.stringify(opts.body))]
   const req = {
     method,
-    url: route.path,
-    headers: { host: '127.0.0.1:3080' },
+    url: path,
     socket: { remoteAddress: '127.0.0.1' },
-    async *[Symbol.asyncIterator]() {},
+    headers: { host: '127.0.0.1:3080' },
   }
-  const res = {
-    writeHead: (status) => { code = status; return res },
-    end: (chunk) => { payload = chunk ?? '' },
-  }
+  req[Symbol.asyncIterator] = async function* () { yield* chunks }
+  const res = {}
+  res.status = undefined
+  res.body = undefined
+  res.writeHead = status => { res.status = status }
+  res.end = body => { res.body = JSON.parse(body) }
   await route.handler(req, res)
-  const body = JSON.parse(payload)
-  return withStatus ? { status: code, body } : body
+  return res
 }
+
+test('apply mounts the full core family; notes stay off without a repo slug', (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+  const paths = ctx.registered.map(route => route.path).sort()
+  assert.deepEqual(paths, [
+    VERSION_API.check,
+    VERSION_API.policy,
+    VERSION_API.restart,
+    VERSION_API.restore,
+    VERSION_API.snapshots,
+    VERSION_API.status,
+    VERSION_API.update,
+  ].sort(), 'notes requires a GitHub repo; this fake manifest has none')
+  assert.equal(new Set(paths).size, paths.length, 'the web server keys routes by path: no family may mount one twice')
+})
+
+test('apply seeds a policy file on first mount and serves it back', async (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+
+  const policyPath = join(dataDir, 'policy.json')
+  assert.equal(existsSync(policyPath), true, 'first mount persists the defaults')
+  assert.equal(JSON.parse(readFileSync(policyPath, 'utf8')).mode, DEFAULT_POLICY.mode)
+
+  const res = await invoke(ctx.registered, VERSION_API.policy)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.policy.mode, DEFAULT_POLICY.mode)
+})
+
+test('policy changes through the route persist immediately', async (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+
+  const res = await invoke(ctx.registered, VERSION_API.policy, {
+    method: 'POST',
+    body: { mode: 'notify', checkAt: '03:30' },
+  })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.policy.mode, 'notify')
+
+  const stored = JSON.parse(readFileSync(join(dataDir, 'policy.json'), 'utf8'))
+  assert.equal(stored.mode, 'notify')
+  assert.equal(stored.checkAt, '03:30')
+
+  // A reload reads the same values back.
+  const ctx2 = fakeCtx()
+  apply(ctx2, { dataDir })
+  const again = await invoke(ctx2.registered, VERSION_API.policy)
+  assert.equal(again.body.result.policy.checkAt, '03:30')
+})
+
+test('status reports the running version from the discovered installation', async (t) => {
+  const { dataDir } = environment(t, '7.7.7')
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+  const res = await invoke(ctx.registered, VERSION_API.status)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.running, '7.7.7')
+  assert.equal(res.body.result.installed, '7.7.7')
+  assert.equal(res.body.result.needsRestart, false)
+})
+
+test('snapshots start empty and restore reports a missing snapshot as conflict', async (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+
+  const listed = await invoke(ctx.registered, VERSION_API.snapshots)
+  assert.deepEqual(listed.body.result.snapshots, [])
+
+  const failed = await invoke(ctx.registered, VERSION_API.restore, {
+    method: 'POST',
+    body: { version: '9.9.9' },
+  })
+  assert.equal(failed.status, 409)
+})
+
+test('disposal unregisters every route and stops the scheduler', (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+  assert.ok(ctx.registered.length > 0)
+  for (const dispose of [...ctx.effects]) dispose?.()
+  assert.equal(ctx.registered.length, 0, 'the routes effect removed every registration')
+})

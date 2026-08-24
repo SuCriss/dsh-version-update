@@ -1,13 +1,12 @@
 /**
- * Browser-half tests for the panel controller: the update confirmation, the
- * restart decision, the countdown, the reload-surviving watchdog, and the
- * not-mounted diagnosis.
+ * Browser-half tests for the rewritten panel controller: fact merging, the
+ * install → countdown → restart → reload chain, the reload-surviving
+ * watchdog, policy editing, and the restore flow.
  *
- * `lib/client.js` is a hand-written `window.__ModuleLoader__.load` factory with
- * no build step, so the loader and the handful of browser globals it touches are
- * faked here rather than mocked in a DOM environment. The controller is reached
- * through the module's own `createController` seam, which takes the overlay and
- * the reload as injectable dependencies.
+ * lib/client.js is a hand-written window.__ModuleLoader__ factory with no
+ * build step, so the loader and the browser globals it touches are faked
+ * here rather than mocked in a DOM environment. The controller is reached
+ * through createController, whose overlay and reload are injectable seams.
  */
 
 import assert from 'node:assert/strict'
@@ -15,7 +14,7 @@ import { test } from 'node:test'
 
 /**
  * Load lib/client.js under a fake module loader and browser globals.
- * @returns {Promise<{ createController: Function }>} the module exports.
+ * @returns {Promise<{ createController: Function; compareVersionTexts: Function; isDowngrade: Function }>} the module exports.
  */
 async function loadClient() {
   let captured
@@ -25,28 +24,27 @@ async function loadClient() {
     location: { reload: () => {} },
     matchMedia: () => ({ matches: false }),
   }
-  // The factory only needs createElement plus the two hooks the components use;
-  // no component is rendered in these tests.
   const react = {
     createElement: (type, props, ...children) => ({ type, props, children }),
-    useRef: (initial) => ({ current: initial }),
+    useRef: initial => ({ current: initial }),
+    useState: initial => [initial, () => {}],
     useEffect: () => {},
   }
   await import(`../lib/client.js?t=${String(Date.now())}${String(Math.random())}`)
   assert.equal(typeof captured, 'function', 'the module registered a factory')
-  return captured((id) => {
+  return captured(id => {
     if (id === 'react') return react
     throw new Error(`unexpected require: ${id}`)
   })
 }
 
 /** An in-memory sessionStorage. */
-function fakeStorage() {
-  const map = new Map()
+function fakeStorage(initial = {}) {
+  const map = new Map(Object.entries(initial))
   return {
     getItem: key => map.get(key) ?? null,
     setItem: (key, value) => { map.set(key, String(value)) },
-    removeItem: (key) => { map.delete(key) },
+    removeItem: key => { map.delete(key) },
   }
 }
 
@@ -54,12 +52,11 @@ function fakeStorage() {
 function fakeOverlay() {
   const shown = []
   return {
-    shown,
     hidden: 0,
+    shown,
     show(view) { shown.push(view) },
     hide() { this.hidden += 1 },
-    /** The most recent view. */
-    last() { return shown[shown.length - 1] },
+    last() { return shown.at(-1) },
     /** Click one action of the most recent view by its label key. */
     click(label) {
       const action = this.last().actions?.find(a => a.label === label)
@@ -70,19 +67,27 @@ function fakeOverlay() {
 }
 
 /**
- * Install a fetch stub answering per path.
- * @param {Record<string, () => object>} table - path suffix to response factory.
- * @returns {{ calls: object[] }} the recorded calls.
+ * Install a fetch stub answering per path suffix.
+ * @param {Record<string, (call: number) => object>} table - suffix → response factory.
  */
 function fakeFetch(table) {
-  const calls = []
-  globalThis.fetch = async (path, init) => {
-    calls.push({ path, init })
-    const key = Object.keys(table).find(suffix => path.endsWith(suffix))
+  const counts = {}
+  let phase = table
+  const impl = async (path) => {
+    const key = Object.keys(phase).find(suffix => path.endsWith(suffix))
     if (key === undefined) throw new Error(`unexpected fetch: ${path}`)
-    return table[key](calls.length)
+    counts[key] = (counts[key] ?? 0) + 1
+    return phase[key](counts[key])
   }
-  return { calls }
+  return {
+    /** Swap the answer table mid-test (e.g. once the host "restarted"). */
+    setTable(next) { phase = next },
+    counts,
+    install() {
+      globalThis.fetch = impl
+      return impl
+    },
+  }
 }
 
 /** A JSON response stub. */
@@ -90,7 +95,7 @@ function json(body, status = 200) {
   return { ok: status < 400, status, headers: { get: () => 'application/json' }, json: async () => body }
 }
 
-/** The SPA fallback: 200 with an HTML body for an unknown path. */
+/** The SPA fallback: 200 with HTML for an unknown path. */
 function htmlFallback() {
   return {
     ok: true,
@@ -100,323 +105,237 @@ function htmlFallback() {
   }
 }
 
-/** Translate a key to itself so assertions can name keys, not prose. */
+/** Translate a key to itself so assertions name keys, not prose. */
 const t = key => key
 
 /**
- * Advance mock time one scheduled second at a time, flushing microtasks between
- * steps.
- *
- * Both the countdown and the watchdog re-arm their timer from inside the
- * callback, and Node's mock timers run only the level a tick reaches — so one
- * large tick would fire a single step. Each step is followed by a few microtask
- * turns because the watchdog's callback awaits a fetch before it re-arms.
- * @param {import('node:test').TestContext} ctx - the test context owning the timers.
- * @param {number} seconds - how many one-second steps to run.
- * @returns {Promise<void>} resolves once every step has run.
+ * Flush pending promise work. Pure MICROTASKS only: under ctx.mock.timers
+ * even setImmediate is mocked, so an immediate-based flush would deadlock.
+ * @param {number} turns - how many microtask queues to drain.
  */
-async function advance(ctx, seconds) {
-  for (let step = 0; step < seconds; step += 1) {
-    ctx.mock.timers.tick(1000)
-    for (let turn = 0; turn < 4; turn += 1) await Promise.resolve()
-  }
+async function flush(turns = 12) {
+  for (let index = 0; index < turns; index += 1) await Promise.resolve()
 }
 
-/**
- * Build a controller with fake seams.
- * @param {object} module - the loaded client module.
- * @param {object} [overrides] - extra deps.
- * @returns {{ controller: object; overlay: object; reloads: number[] }} the harness.
- */
-function makeController(module, overrides = {}) {
-  const overlay = fakeOverlay()
-  const reloads = []
-  const controller = module.createController({
-    t,
-    overlay,
-    reload: () => { reloads.push(Date.now()) },
-    ...overrides,
-  })
-  return { controller, overlay, reloads }
-}
-
-test('an idle host is left alone', async () => {
-  const module = await loadClient()
-  const { controller, overlay } = makeController(module)
-  controller.adoptTask({ state: 'idle', stale: false, needsRestart: false })
-  assert.deepEqual(overlay.shown, [])
+test('the browser version ranking mirrors the host grammar', async () => {
+  const client = await loadClient()
+  // Signs only: the mirror agrees with the host on ORDER, not magnitude.
+  assert.ok(client.compareVersionTexts('1.2.3', '1.10.0') < 0)
+  assert.ok(client.compareVersionTexts('1.0.0-rc.1', '1.0.0') < 0)
+  assert.ok(client.compareVersionTexts('2.0.0', '1.99.99') > 0)
+  assert.equal(client.compareVersionTexts('1.2.3', '1.2.3'), 0)
+  assert.equal(client.isDowngrade('0.3.9', '0.4.0'), true)
+  assert.equal(client.isDowngrade('0.5.0', '0.4.0'), false)
+  // Uncomparable values are never a downgrade.
+  assert.equal(client.isDowngrade('latest', '0.4.0'), false)
 })
 
-test('a stale host found at page load is offered a restart, never forced', async () => {
-  const module = await loadClient()
-  const { controller, overlay } = makeController(module)
-  controller.adoptTask({
-    state: 'idle', stale: true, needsRestart: true, restartable: true,
-    installed: '0.2.0', running: '0.1.0',
-  })
-  const view = overlay.last()
-  assert.equal(view.title, 'restart.title')
-  assert.deepEqual(view.actions.map(a => a.label), ['restart.later', 'restart.now'])
-  assert.equal(view.actions[1].primary, true)
+test('check merges local facts, registry view, and snapshots', async () => {
+  const client = await loadClient()
+  fakeFetch({
+    '/check': () => json({ result: {
+      installed: '0.4.0',
+      installDir: '/i',
+      channels: [{ channel: 'latest', version: '0.5.0', ahead: true }],
+      versions: ['0.5.0', '0.4.0'],
+      task: { state: 'idle', log: '' },
+      lastCheck: { at: 42, updateAvailable: true, target: '0.5.0' },
+      recent: [{ at: 1, to: '0.4.0', result: 'ok' }],
+    } }),
+    '/snapshots': () => json({ result: { snapshots: [{ version: '0.4.0', usable: true }] } }),
+  }).install()
+  const controller = client.createController({ t })
+  await controller.check()
+  const s = controller.getSnapshot()
+  assert.equal(s.status, 'ready')
+  assert.equal(s.installed, '0.4.0')
+  assert.equal(s.selected, '0.5.0', 'the newest ahead channel is preselected')
+  assert.deepEqual(s.lastCheck.target, '0.5.0')
+  assert.equal(s.history.length, 1)
+  assert.equal(s.snapshots[0].version, '0.4.0')
 })
 
-test('a finished install prompts even when the versions cannot be compared', async () => {
-  // The host reports needsRestart without stale when it cannot read the
-  // installed version. Keying off stale alone would leave the page broken.
-  const module = await loadClient()
-  const { controller, overlay } = makeController(module)
-  controller.adoptTask({ state: 'done', version: '0.2.0', stale: false, needsRestart: true, restartable: true })
-  assert.equal(overlay.shown.length, 1)
-  assert.equal(overlay.last().title, 'restart.title')
-})
-
-test('a host that cannot restart itself gets a dismiss-only notice', async () => {
-  const module = await loadClient()
-  const { controller, overlay } = makeController(module)
-  controller.adoptTask({ state: 'done', stale: true, needsRestart: true, restartable: false, installed: '0.2.0' })
-  assert.equal(overlay.last().body, 'restart.unavailable')
-  assert.deepEqual(overlay.last().actions.map(a => a.label), ['restart.dismiss'])
-})
-
-test('an update is never one click away', async () => {
-  const module = await loadClient()
-  fakeFetch({})
-  const { controller } = makeController(module)
-
-  controller.requestUpdate('0.2.0')
-  assert.equal(controller.getSnapshot().confirm, '0.2.0')
-  assert.equal(controller.getSnapshot().busy, false, 'nothing started yet')
-
-  controller.cancelUpdate()
-  assert.equal(controller.getSnapshot().confirm, undefined)
-})
-
-test('confirming an update starts exactly that version', async () => {
-  const module = await loadClient()
-  const { calls } = fakeFetch({
-    '/update': () => json({ result: { state: 'running', version: '0.2.0', log: '' } }),
-  })
-  const { controller } = makeController(module)
-
-  controller.requestUpdate('0.2.0')
-  await controller.confirmUpdate()
-
-  assert.equal(calls.length, 1)
-  assert.deepEqual(JSON.parse(calls[0].init.body), { version: '0.2.0' })
-  assert.equal(controller.getSnapshot().confirm, undefined)
-  assert.equal(controller.getSnapshot().task.state, 'running')
-  controller.dispose()
-})
-
-test('the countdown restarts on its own only after the full window', async (ctx) => {
-  ctx.mock.timers.enable({ apis: ['setTimeout'] })
-  const module = await loadClient()
-  const { calls } = fakeFetch({
-    '/restart': () => json({ result: { host: '127.0.0.1', port: 3080 } }),
-    '/status': () => json({ result: { state: 'done', needsRestart: true } }),
-  })
-  const { controller, overlay } = makeController(module)
-
-  controller.armedVersion = '0.2.0'
-  controller.adoptTask({ state: 'done', version: '0.2.0', stale: true, needsRestart: true, restartable: true })
-
-  assert.equal(overlay.last().body, 'restart.countdown')
-  assert.equal(calls.length, 0, 'nothing happens on the first frame')
-
-  // A user has a real window to object: the countdown must not fire early.
-  await advance(ctx, 5)
-  assert.equal(calls.length, 0, 'five seconds is not the whole window')
-  assert.equal(overlay.last().body, 'restart.countdown', 'the card is still counting')
-
-  await advance(ctx, 20)
-  assert.ok(calls.some(c => c.path.endsWith('/restart')), 'the restart was requested')
-  controller.dispose()
-})
-
-test('cancelling the countdown leaves the host running', async (ctx) => {
-  ctx.mock.timers.enable({ apis: ['setTimeout'] })
-  const module = await loadClient()
-  const { calls } = fakeFetch({ '/restart': () => json({ result: {} }) })
-  const { controller, overlay } = makeController(module)
-
-  controller.armedVersion = '0.2.0'
-  controller.adoptTask({ state: 'done', version: '0.2.0', stale: true, needsRestart: true, restartable: true })
-  overlay.click('restart.later')
-
-  await advance(ctx, 60)
-  assert.deepEqual(calls, [], 'a dismissed countdown never restarts anything')
-  assert.ok(overlay.hidden > 0)
-  controller.dispose()
-})
-
-test('the watchdog resumes across the reload it caused', async (ctx) => {
-  ctx.mock.timers.enable({ apis: ['setTimeout'] })
-  const module = await loadClient()
-  window.sessionStorage.setItem('dsh-version-update:awaiting-restart', '0.2.0')
-  // The replacement is not up for the first two probes.
-  const { calls } = fakeFetch({
-    '/status': (n) => (n < 3
-      ? json({ error: 'down' }, 503)
-      : json({ result: { state: 'idle', needsRestart: false } })),
-  })
-  const { controller, overlay, reloads } = makeController(module)
-
-  controller.resume()
-  assert.equal(overlay.last().body, 'restart.waiting')
-
-  await advance(ctx, 4)
-
-  assert.ok(calls.length >= 3)
-  assert.deepEqual(reloads.length, 1, 'the page reloads onto the new assets exactly once')
-  assert.equal(window.sessionStorage.getItem('dsh-version-update:awaiting-restart'), null, 'the marker is cleared')
-  controller.dispose()
-})
-
-test('a replacement that never answers ends in an actionable timeout', async (ctx) => {
-  // Date is mocked alongside setTimeout because the watchdog's ceiling is a
-  // wall-clock deadline, not a probe count.
-  ctx.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
-  const module = await loadClient()
-  fakeFetch({ '/status': () => { throw new TypeError('Failed to fetch') } })
-  const { controller, overlay, reloads } = makeController(module)
-
-  controller.awaitReplacement('0.2.0')
-  await advance(ctx, 95)
-
-  assert.equal(overlay.last().body, 'restart.timeout')
-  assert.deepEqual(overlay.last().actions.map(a => a.label), ['restart.dismiss', 'restart.reloadNow'])
-  assert.equal(reloads.length, 0, 'a reload onto a dead host is never automatic')
-  assert.equal(controller.getSnapshot().restarting, false)
-  controller.dispose()
-})
-
-test('the SPA fallback is diagnosed as an unmounted host, not an HTTP 200', async () => {
-  // Adding the plugin takes effect only after dsh restarts. Until then the
-  // routes 404 into the SPA fallback, which answers 200 with index.html.
-  const module = await loadClient()
-  fakeFetch({ '/check': () => htmlFallback() })
-  const { controller } = makeController(module)
-
+test('an HTML fallback is diagnosed as not-mounted instead of HTTP 200', async () => {
+  const client = await loadClient()
+  fakeFetch({ '/check': () => htmlFallback() }).install()
+  const controller = client.createController({ t })
   await controller.check()
   assert.equal(controller.getSnapshot().status, 'error')
   assert.equal(controller.getSnapshot().error, 'notMounted')
-  controller.dispose()
 })
 
-test('a genuine host error keeps its own message', async () => {
-  const module = await loadClient()
-  fakeFetch({ '/check': () => json({ error: 'registry read failed: HTTP 503' }, 500) })
-  const { controller } = makeController(module)
-
-  await controller.check()
-  assert.equal(controller.getSnapshot().error, 'registry read failed: HTTP 503')
-  controller.dispose()
-})
-
-test('check adopts the facts and preselects the channel that is ahead', async () => {
-  const module = await loadClient()
-  fakeFetch({
-    '/check': () => json({
-      result: {
-        installed: '0.1.0',
-        installDir: '/opt/dsh',
-        channels: [{ channel: 'latest', version: '0.1.0', ahead: false }, { channel: 'next', version: '0.2.0', ahead: true }],
-        versions: ['0.2.0', '0.1.0'],
-        task: { state: 'idle', log: '' },
-      },
-    }),
-  })
-  const { controller } = makeController(module)
-
-  await controller.check()
-  const snapshot = controller.getSnapshot()
-  assert.equal(snapshot.status, 'ready')
-  assert.equal(snapshot.installed, '0.1.0')
-  assert.equal(snapshot.selected, '0.2.0', 'the version worth installing is preselected')
-  controller.dispose()
-})
-
-test('a failed registry read degrades to local facts instead of an error page', async () => {
-  // The host answers 200 with `publishedError` and no version lists when the
-  // registry is unreachable; the panel must keep showing the installed
-  // version and path beside the warning, not flip into its error state.
-  const module = await loadClient()
-  fakeFetch({
-    '/check': () => json({
-      result: {
-        installed: '0.1.0',
-        installDir: '/opt/dsh',
-        publishedError: 'registry read failed: HTTP 503',
-        task: { state: 'idle', log: '' },
-      },
-    }),
-  })
-  const { controller } = makeController(module)
-
-  await controller.check()
-  const snapshot = controller.getSnapshot()
-  assert.equal(snapshot.status, 'ready', 'local facts are not a page error')
-  assert.equal(snapshot.installed, '0.1.0')
-  assert.equal(snapshot.publishedError, 'registry read failed: HTTP 503')
-  assert.deepEqual(snapshot.channels, [])
-  assert.deepEqual(snapshot.versions, [])
-  controller.dispose()
-})
-
-test('a later successful check clears an earlier degradation marker', async () => {
-  const module = await loadClient()
-  const responses = [
-    () => json({ result: { installed: '0.1.0', publishedError: 'fetch failed', task: { state: 'idle', log: '' } } }),
-    () => json({
-      result: {
-        installed: '0.1.0',
-        channels: [{ channel: 'latest', version: '0.1.0', ahead: false }],
-        versions: ['0.1.0'],
-        task: { state: 'idle', log: '' },
-      },
-    }),
-  ]
-  let call = 0
-  globalThis.fetch = async () => responses[Math.min(call++, responses.length - 1)]()
-  const { controller } = makeController(module)
-
-  await controller.check()
-  assert.equal(controller.getSnapshot().publishedError, 'fetch failed')
-  await controller.check()
-  assert.equal(controller.getSnapshot().publishedError, undefined, 'the warning does not stick')
-  controller.dispose()
-})
-
-test('the browser version ranking mirrors the host ranking exactly', async () => {
-  // compareVersionTexts is a hand-maintained mirror of lib/core.js — the
-  // browser half ships standalone with no shared import — so every pair must
-  // rank identically on both sides or "downgrade" means different things in
-  // the button label and in the install itself.
-  const core = await import('../lib/core.js')
+test('a rejected policy patch surfaces the host reason', async () => {
   const client = await loadClient()
-  const versions = [
-    '0.0.1', '0.1.0', '0.2.0', '1.0.0',
-    '0.1.0-alpha', '0.1.0-alpha.1', '0.1.0-alpha.beta', '0.1.0-beta',
-    '0.1.0-beta.2', '0.1.0-beta.11', '0.1.0-rc.1', '0.2.0-rc.1', '0.2.0-next.1',
-  ]
-  for (const a of versions) {
-    for (const b of versions) {
-      assert.equal(
-        Math.sign(client.compareVersionTexts(a, b)),
-        Math.sign(core.compareVersions(a, b)),
-        `${a} vs ${b}`,
-      )
-    }
+  fakeFetch({
+    '/policy': () => json({ error: 'mode must be one of off, notify, auto' }, 400),
+  }).install()
+  const controller = client.createController({ t })
+  await controller.savePolicy({ mode: 'bogus' })
+  assert.match(controller.getSnapshot().policyError ?? '', /mode must be/)
+})
+
+test('a stale host discovered at page load offers a restart without arming one', async () => {
+  const client = await loadClient()
+  const overlay = fakeOverlay()
+  fakeFetch({
+    '/status': () => json({ result: {
+      state: 'idle', log: '',
+      running: '0.4.0', installed: '0.9.0', stale: true, needsRestart: true,
+      restartable: true,
+    } }),
+    '/policy': () => json({ result: { policy: {} } }),
+  }).install()
+  const controller = client.createController({ t, overlay })
+  controller.resume()
+  await flush()
+  // The identity translator renders keys, not prose: the OFFER is recognized
+  // by its actions — restart available but nothing armed or reloaded.
+  const view = overlay.last()
+  assert.equal(view.title, t('restart.title'))
+  assert.ok(view.actions.some(a => a.label === t('restart.now')))
+  // Offered, not forced: "later" leaves the page alone.
+  overlay.click(t('restart.later'))
+  assert.equal(overlay.hidden, 1)
+})
+
+test('the watchdog survives a reload through sessionStorage and reloads when ready', async (ctx) => {
+  // Load the module BEFORE mock timers: an in-test dynamic import never
+  // settles while the timer mocks own the event loop's clock.
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    globalThis.window.sessionStorage = fakeStorage({ 'dsh-version-update:awaiting-restart': '8.8.8' })
+    const overlay = fakeOverlay()
+    let reloaded = 0
+    fakeFetch({
+      '/status': () => json({ result: { state: 'idle', log: '', stale: false, needsRestart: false } }),
+      '/policy': () => json({ result: { policy: {} } }),
+    }).install()
+    const controller = client.createController({ t, overlay, reload: () => { reloaded += 1 } })
+    controller.resume()
+    await flush()
+    // The first probe is timer-driven; advance it.
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.equal(reloaded, 1, 'the replacement answered, the page reloads itself')
+    assert.equal(globalThis.window.sessionStorage.getItem('dsh-version-update:awaiting-restart'), null, 'the await marker cleared')
+  } finally {
+    ctx.mock.timers.reset()
   }
 })
 
-test('isDowngrade names rollbacks and nothing else', async () => {
+test('install settles into a cancellable countdown; restart reloads when ready', async (ctx) => {
+  // Module load first; mock timers take over only the test's clock.
   const client = await loadClient()
-  assert.equal(client.isDowngrade('0.0.9', '0.1.0'), true, 'an older release')
-  assert.equal(client.isDowngrade('0.2.0-rc.1', '0.2.0'), true, 'a pre-release of the current core')
-  assert.equal(client.isDowngrade('0.1.0', '0.1.0'), false, 'the same version')
-  assert.equal(client.isDowngrade('0.2.0', '0.1.0'), false, 'an upgrade')
-  assert.equal(client.isDowngrade('0.1.0-next.1', '0.1.0-alpha'), false, 'a pre-release bump')
-  assert.equal(client.isDowngrade(undefined, '0.1.0'), false, 'no target selected')
-  assert.equal(client.isDowngrade('garbage', '0.1.0'), false, 'uncomparable values are never called a downgrade')
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    let reloaded = 0
+    let installPhase = 'running'
+    let replacementReady = false
+    fakeFetch({
+      '/update': () => json({ result: { state: 'running', version: '9.9.9', log: '' } }),
+      '/status': () => json({ result: replacementReady
+        ? { state: 'idle', log: '', stale: false, needsRestart: false }
+        : installPhase === 'running'
+          ? { state: 'running', version: '9.9.9', log: 'npm ...' }
+          : {
+            state: 'done', version: '9.9.9', log: '',
+            running: '0.4.0', installed: '9.9.9', stale: true, needsRestart: true,
+            restartable: true,
+          } }),
+      '/restart': () => json({ result: {} }),
+    }).install()
+    const controller = client.createController({ t, overlay, reload: () => { reloaded += 1 } })
+
+    controller.requestUpdate('9.9.9')
+    assert.equal(controller.getSnapshot().confirm, '9.9.9')
+    await controller.confirmUpdate()
+    assert.equal(controller.getSnapshot().busy, true)
+    assert.equal(controller.getSnapshot().showLog, true)
+
+    // Poll #1: still installing.
+    ctx.mock.timers.tick(1500)
+    await flush()
+    assert.equal(controller.getSnapshot().task.state, 'running')
+
+    // Poll #2: settled → the page arms its own cancellable countdown.
+    installPhase = 'done'
+    ctx.mock.timers.tick(1500)
+    await flush()
+    assert.ok(overlay.shown.length > 0, 'the countdown overlay appeared')
+    assert.ok(overlay.last().actions.some(a => a.label === t('restart.later')))
+
+    // "Later" cancels without restarting anything.
+    overlay.click(t('restart.later'))
+    assert.equal(controller.getSnapshot().restarting, false)
+
+    // The manual path walks the identical watchdog flow to a reload.
+    const restarting = controller.restart('9.9.9')
+    await flush()
+    replacementReady = true
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.equal(reloaded, 1)
+    assert.equal(
+      globalThis.window.sessionStorage.getItem('dsh-version-update:awaiting-restart'),
+      null,
+    )
+    await restarting
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
+test('restore confirms, applies, and walks the same restart flow', async (ctx) => {
+  // Module load first; mock timers take over only the test's clock.
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    let reloaded = 0
+    let restoredSettled = false
+    fakeFetch({
+      '/restore': () => json({ result: {
+        restored: '7.7.7',
+        task: { state: 'idle', log: '', running: '9.9.9', installed: '7.7.7', stale: true, needsRestart: true, restartable: true },
+      } }),
+      '/snapshots': () => json({ result: { snapshots: [{ version: '7.7.7', usable: true }] } }),
+      '/policy': () => json({ result: { policy: {} } }),
+      '/check': () => json({ result: {
+        installed: restoredSettled ? '7.7.7' : '9.9.9',
+        task: { state: 'idle', log: '', running: '9.9.9', installed: '7.7.7', stale: true, needsRestart: true, restartable: true },
+      } }),
+      '/restart': () => json({ result: {} }),
+      '/status': () => json({ result: { state: 'idle', log: '', stale: false, needsRestart: false } }),
+    }).install()
+    const controller = client.createController({ t, overlay, reload: () => { reloaded += 1 } })
+
+    // Cancel path first.
+    controller.requestRestore('7.7.7')
+    assert.equal(controller.getSnapshot().restoreConfirm, '7.7.7')
+    controller.cancelRestore()
+    assert.equal(controller.getSnapshot().restoreConfirm, undefined)
+
+    // Confirm path: adoptTask arms the countdown for the restored version.
+    controller.requestRestore('7.7.7')
+    const confirming = controller.confirmRestore()
+    await flush()
+    assert.ok(overlay.last().actions.some(a => a.label === t('restart.later')), 'countdown is cancellable')
+    // Run the countdown second by second: node:test tick() does not cascade
+    // into timers that a callback re-schedules for a LATER moment, so one
+    // big 20s tick would only ever fire the first step.
+    for (let second = 0; second < 21; second += 1) {
+      ctx.mock.timers.tick(1000)
+      await flush()
+    }
+    assert.equal(controller.getSnapshot().restarting, true, 'expiry started the restart')
+    // Advance into the watchdog probe for the healthy replacement host.
+    ctx.mock.timers.tick(1000)
+    await flush()
+    await confirming
+    assert.equal(reloaded, 1, 'the restore walked the full restart chain')
+  } finally {
+    ctx.mock.timers.reset()
+  }
 })

@@ -3,6 +3,50 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.0.0]
+
+A ground-up rewrite. Same plugin identity and host/browser shape, a different
+product: version management with automation and instant rollback instead of a
+manual update button.
+
+### Added
+
+- **Local snapshot rollback.** Every install snapshots the running tree to
+  `~/.dsh-version-update/snapshots/<version>/` (metadata-stamped, validated on
+  every read) before npm touches anything; restoring is a pure filesystem copy
+  that needs neither npm nor network and completes in seconds. Snapshots are
+  pruned to `snapshotKeep` (default 5), damaged entries first. Restore rides
+  the same confirm + restart flow as an install.
+- **Policy engine** persisted at `~/.dsh-version-update/policy.json`, edited
+  from the panel via the new `GET|POST /api/dsh-version-update/policy`:
+  - `mode: off | notify | auto` — silent auto-update with no human in the loop.
+  - `track: {kind:'tag'} | {kind:'line'} | {kind:'pin'}` — follow any dist-tag
+    or a caret/tilde version line (stable releases only); pin tracks nothing.
+  - `window` — an HH:MM execution window for auto installs; midnight wrap
+    supported, out-of-window findings park and install when it opens.
+  - `restart: ask | auto` — cancellable countdown vs unattended ~10 s restart.
+  - `checkAt` — a daily scheduled check replacing `autoCheckIntervalHours`.
+- **Snapshot center routes**: `GET /snapshots` and `POST /restore`
+  (`409` while an install runs, `409` naming any unusable target).
+- **dataDir entry config** relocating policy/history/snapshots.
+- **recoverOnFailedRestart** (default off): when a restarted host never becomes
+  reachable, the relaunch helper restores the previous version from its local
+  snapshot — replacing v0.x's npm-based rollback, which needed the registry.
+
+### Changed
+
+- The panel is rebuilt around six cards: installation facts, policy form,
+  versions, task log, snapshot center, recent activity; history entries now
+  record who triggered them (`manual|auto|scheduled`) and restores are marked.
+- History no longer derives rollback offers — the snapshot store answers that
+  far more reliably; entries stay valid for readers of old files.
+
+### Removed
+
+- **Agent announcements.** `announceToAgent`, the injected capability section,
+  and pending-update notices in the model's system prompt are gone; the plugin
+  no longer writes anything into agent context.
+
 ## [0.4.0]
 
 ### Added

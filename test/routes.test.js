@@ -1,403 +1,309 @@
 /**
- * Route tests over a real HTTP server: the fence, the method guard, the
- * staleness facts the panel decides on, the exact-version guard, and the
- * restart route's behaviour with and without a restarter.
+ * Route family tests: envelopes, fences, status codes, and every operation
+ * wired behind injected fakes — including the new policy endpoints and the
+ * snapshot center.
  */
 
 import assert from 'node:assert/strict'
-import { createServer } from 'node:http'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
-
+import { VERSION_API, DEFAULT_POLICY } from '../lib/protocol.js'
 import { makeRoutes } from '../lib/routes.js'
 
+/** A response double recording one answer. */
+function resStub() {
+  const res = {}
+  res.status = undefined
+  res.body = undefined
+  res.writeHead = (status) => { res.status = status }
+  res.end = (body) => { res.body = JSON.parse(body) }
+  return res
+}
+
 /**
- * Serve one route family on a loopback port for the duration of a test body.
- * @param {object} deps - makeRoutes deps.
- * @param {(base: string) => Promise<void>} body - the test body.
- * @returns {Promise<void>} resolves once the server is closed.
+ * Drive one registered route.
+ * @param {object[]} routes - registered routes.
+ * @param {string} path - the route path.
+ * @param {{ method?: string; body?: unknown; fenced?: boolean }} [opts] - request shape.
  */
-async function serving(deps, body) {
-  const { routes } = makeRoutes(deps)
-  const table = new Map(routes.map(route => [route.path, route.handler]))
-  const server = createServer((req, res) => {
-    const handler = table.get(new URL(req.url ?? '/', 'http://localhost').pathname)
-    if (handler === undefined) {
-      res.writeHead(404).end()
-      return
-    }
-    void handler(req, res)
-  })
-  await new Promise(resolve => { server.listen(0, '127.0.0.1', resolve) })
-  const { port } = server.address()
-  try {
-    await body(`http://127.0.0.1:${String(port)}`)
-  } finally {
-    await new Promise(resolve => { server.close(resolve) })
+async function invoke(routes, path, opts = {}) {
+  const method = opts.method ?? 'GET'
+  const route = routes.find(candidate => candidate.path === path)
+  assert.ok(route !== undefined, `route ${path} is registered`)
+  const chunks = opts.body === undefined ? [] : [Buffer.from(JSON.stringify(opts.body))]
+  const req = {
+    method,
+    url: `${path}${opts.query ?? ''}`,
+    socket: { remoteAddress: opts.fenced === false ? '10.9.8.7' : '127.0.0.1' },
+    headers: { host: '127.0.0.1:3080' },
   }
+  req[Symbol.asyncIterator] = async function* () { yield* chunks }
+  const res = resStub()
+  await route.handler(req, res)
+  return res
 }
 
-/**
- * Issue one request and read its JSON body.
- * @param {string} url - the absolute URL.
- * @param {object} [init] - fetch init.
- * @returns {Promise<{ status: number; body: any }>} status and parsed body.
- */
-async function call(url, init) {
-  const response = await fetch(url, init)
-  return { status: response.status, body: await response.json() }
-}
-
-/** An updater stand-in recording the versions it was asked to install. */
-function fakeUpdater(overrides = {}) {
+/** Standard fakes for the whole family. */
+function harness(overrides = {}) {
+  /** @type {any[]} */
   const started = []
-  return {
-    started,
-    view: () => ({ state: 'idle', log: '', ...overrides.view }),
-    start: (version) => {
-      if (overrides.startThrows !== undefined) throw new Error(overrides.startThrows)
-      started.push(version)
+  const updater = {
+    view: () => overrides.taskView?.() ?? { state: 'idle', log: '' },
+    start: (version, trigger) => {
+      if ((overrides.busy?.()) === true) throw new Error('an update is already running')
+      started.push({ version, trigger })
       return { state: 'running', version, log: '' }
     },
   }
+  // A deterministic fake installation so the routes never probe the real
+  // global tree of whatever machine runs the tests.
+  const installDir = mkdtempSync(join(tmpdir(), 'vu-routes-'))
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: overrides.installedVersion ?? '0.4.0' }))
+  const deps = {
+    updater,
+    running: overrides.runningVersion ?? '0.4.0',
+    installDir,
+    ...overrides.deps,
+  }
+  const { routes } = makeRoutes(deps)
+  // Registered here so one sweep at the end of the file can reclaim them.
+  tempDirs.push(installDir)
+  return {
+    routes,
+    started,
+    cleanup: () => rmSync(installDir, { recursive: true, force: true }),
+  }
 }
 
-const PATHS = {
-  check: '/api/dsh-version-update/check',
-  update: '/api/dsh-version-update/update',
-  status: '/api/dsh-version-update/status',
-  restart: '/api/dsh-version-update/restart',
-  notes: '/api/dsh-version-update/notes',
-}
+/** Every fake installation this file created, reclaimed by the final test. */
+const tempDirs = []
 
-test('the four core routes are exact-path routes', () => {
-  const { routes } = makeRoutes({ updater: fakeUpdater() })
-  assert.deepEqual(routes.map(route => route.path).sort(), [
-    PATHS.check, PATHS.restart, PATHS.status, PATHS.update,
+test('the full route family registers; optional routes appear only when wired', () => {
+  const full = harness({
+    deps: {
+      restarter: { restart: () => ({}) },
+      notes: async () => ({}),
+      repoSlug: 'o/r',
+      policy: { get: () => DEFAULT_POLICY, set: () => {} },
+      snapshots: { list: () => [], restore: () => ({ ok: true }) },
+    },
+  })
+  for (const path of Object.values(VERSION_API)) {
+    assert.ok(full.routes.some(route => route.path === path), path)
+  }
+
+  // Without optional wiring the restart route still mounts (it answers 501);
+  // only notes/policy/snapshots appear when their operations are wired.
+  const bare = harness()
+  assert.deepEqual(bare.routes.map(r => r.path).sort(), [
+    VERSION_API.check, VERSION_API.restart, VERSION_API.status, VERSION_API.update,
   ])
-  assert.ok(routes.every(route => route.kind === 'exact'))
 })
 
-test('every route refuses a request the fence rejects', async () => {
-  // The four core routes always mount; the conditional notes route inherits
-  // the same fence through `guarded`, covered by its own tests below.
-  await serving({ updater: fakeUpdater(), fence: () => false }, async (base) => {
-    const core = [PATHS.check, PATHS.update, PATHS.status, PATHS.restart]
-    for (const [index, path] of core.entries()) {
-      const get = await call(base + path)
-      assert.equal(get.status, 403, path)
-      assert.match(get.body.error, /loopback-only/)
-      const post = await call(base + path, { method: 'POST' })
-      assert.equal(post.status, 403, `${path} (POST)`)
-      void index
-    }
-  })
+test('the loopback fence answers 403 before touching any handler', async () => {
+  const { routes } = harness()
+  const res = await invoke(routes, VERSION_API.check, { fenced: false })
+  assert.equal(res.status, 403)
 })
 
-test('each route accepts only its own method', async () => {
-  await serving({ updater: fakeUpdater(), fence: () => true }, async (base) => {
-    const postToGet = await call(base + PATHS.status, { method: 'POST' })
-    assert.equal(postToGet.status, 405)
-    const getToPost = await call(base + PATHS.update)
-    assert.equal(getToPost.status, 405)
-    const getRestart = await call(base + PATHS.restart)
-    assert.equal(getRestart.status, 405, 'a navigation must not be able to restart the host')
-  })
+test('wrong methods are refused with 405', async () => {
+  const { routes } = harness()
+  const res = await invoke(routes, VERSION_API.check, { method: 'POST' })
+  assert.equal(res.status, 405)
 })
 
-test('check reports the installed version, channels, and the task view', async () => {
-  await serving({
-    updater: fakeUpdater(),
-    fence: () => true,
-    running: '0.1.0-rc.7',
-    installDir: process.cwd(),
-    fetchImpl: async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        'dist-tags': { latest: '9.9.9' },
-        versions: { '9.9.9': {}, '0.0.1': {} },
+test('check returns local facts plus the published view and ambient fields', async () => {
+  const { routes } = harness({
+    deps: {
+      ambient: () => ({ lastCheck: { at: 5 }, recent: [] }),
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {}, '0.4.0': {} } }),
       }),
-    }),
-  }, async (base) => {
-    const { status, body } = await call(base + PATHS.check)
-    assert.equal(status, 200)
-    // installDir points at this package, so the installed version is its own.
-    assert.equal(typeof body.result.installed, 'string')
-    assert.deepEqual(body.result.channels, [{ channel: 'latest', version: '9.9.9', ahead: true }])
-    assert.deepEqual(body.result.versions, ['9.9.9', '0.0.1'])
-    assert.equal(body.result.installDir, process.cwd())
-    assert.equal(body.result.task.running, '0.1.0-rc.7')
-    assert.equal(body.result.task.restartable, false)
-    assert.equal('publishedError' in body.result, false, 'a clean read carries no degradation marker')
+    },
   })
+  const res = await invoke(routes, VERSION_API.check)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.installed, '0.4.0')
+  assert.equal(res.body.result.channels[0].version, '0.5.0')
+  assert.equal(res.body.result.lastCheck.at, 5)
+  assert.equal(res.body.result.task.running, '0.4.0')
 })
 
-test('check reports a failed registry read as degraded local facts', async () => {
-  // An offline machine still has an installed version and an install path;
-  // burying them behind the registry failure would empty the panel for what
-  // is a network problem, not a host problem. The failure travels as
-  // `publishedError`, and the version lists are simply absent.
-  await serving({
-    updater: fakeUpdater(),
-    fence: () => true,
-    running: '0.1.0',
-    installDir: process.cwd(),
-    fetchImpl: async () => ({ ok: false, status: 503 }),
-  }, async (base) => {
-    const { status, body } = await call(base + PATHS.check)
-    assert.equal(status, 200)
-    assert.equal(typeof body.result.installed, 'string', 'the local version survives')
-    assert.equal(body.result.installDir, process.cwd())
-    assert.match(body.result.publishedError, /HTTP 503/)
-    assert.equal('channels' in body.result, false)
-    assert.equal('versions' in body.result, false)
-    assert.equal(body.result.task.running, '0.1.0', 'the task view still rides along')
+test('a failing registry read degrades check instead of failing it', async () => {
+  const { routes } = harness({
+    deps: {
+      fetchImpl: async () => { throw new Error('EAI_AGAIN') },
+    },
   })
+  const res = await invoke(routes, VERSION_API.check)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.publishedError, 'EAI_AGAIN')
+  assert.equal(res.body.result.channels, undefined)
+  assert.equal(res.body.result.installed, '0.4.0')
 })
 
-test('check degrades identically when the registry is unreachable', async () => {
-  await serving({
-    updater: fakeUpdater(),
-    fence: () => true,
-    installDir: process.cwd(),
-    fetchImpl: async () => { throw new TypeError('fetch failed') },
-  }, async (base) => {
-    const { status, body } = await call(base + PATHS.check)
-    assert.equal(status, 200)
-    assert.equal(body.result.publishedError, 'fetch failed')
-    assert.equal(typeof body.result.installed, 'string')
-  })
+test('update validates the target and always records manual trigger', async () => {
+  const { routes, started } = harness()
+  const bad = await invoke(routes, VERSION_API.update, { method: 'POST', body: { version: '^1.0.0' } })
+  assert.equal(bad.status, 400)
+
+  const good = await invoke(routes, VERSION_API.update, { method: 'POST', body: { version: '0.5.0' } })
+  assert.equal(good.status, 200)
+  assert.deepEqual(started, [{ version: '0.5.0', trigger: 'manual' }])
 })
 
-test('status carries the staleness facts the panel decides on', async () => {
-  // running !== installed is exactly the window where the open page holds
-  // assets the new tree no longer has, so a reload is not enough.
-  await serving({
-    updater: fakeUpdater(),
-    fence: () => true,
-    running: '0.1.0-rc.7',
-    installDir: process.cwd(),
-  }, async (base) => {
-    const { body } = await call(base + PATHS.status)
-    assert.equal(body.result.running, '0.1.0-rc.7')
-    assert.equal(typeof body.result.installed, 'string', 'the watchdog needs the version to name')
-    assert.equal(body.result.stale, body.result.running !== body.result.installed)
-    assert.equal(body.result.needsRestart, body.result.stale)
-  })
+test('update reports a busy runner as 409', async () => {
+  const { routes } = harness({ busy: () => true })
+  const res = await invoke(routes, VERSION_API.update, { method: 'POST', body: { version: '0.5.0' } })
+  assert.equal(res.status, 409)
 })
 
-test('status reports no staleness when the running version is unknown', async () => {
-  await serving({ updater: fakeUpdater(), fence: () => true, installDir: process.cwd() }, async (base) => {
-    const { body } = await call(base + PATHS.status)
-    assert.equal('running' in body.result, false)
-    assert.equal(body.result.stale, false, 'an unknown running version must not force a restart prompt')
-    assert.equal(body.result.needsRestart, false, 'and an idle host must not be told to restart')
-  })
+test('status exposes staleness derived from running vs installed', async () => {
+  // The fake install is at 0.5.0 while the process booted with 0.4.0: exactly
+  // the post-install state, and staleness must say so even before any task.
+  const { routes } = harness({ installedVersion: '0.5.0' })
+  const res = await invoke(routes, VERSION_API.status)
+  const result = res.body.result
+  assert.equal(result.running, '0.4.0')
+  assert.equal(result.installed, '0.5.0')
+  assert.equal(result.stale, true)
+  assert.equal(result.needsRestart, true)
+  assert.equal(result.restartable, false, 'no restarter wired here')
 })
 
-test('a finished install needs a restart even when the versions cannot be compared', async () => {
-  // A process cannot swap its own module tree, so a completed install proves
-  // this one is running superseded code. Without this the panel would leave a
-  // host with an unknown installed version silently broken after an update.
-  await serving({
-    updater: fakeUpdater({ view: { state: 'done', version: '9.9.9', log: '' } }),
-    fence: () => true,
-    installDir: '/nonexistent/place',
-  }, async (base) => {
-    const { body } = await call(base + PATHS.status)
-    assert.equal(body.result.stale, false, 'nothing to compare')
-    assert.equal(body.result.needsRestart, true)
-  })
+/** Reclaim every temp installation this file created (runs last). */
+test('route fixtures clean up their temporary installations', () => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true })
+  assert.ok(tempDirs.length > 0)
 })
 
-test('update starts an install for one exact version', async () => {
-  const updater = fakeUpdater()
-  await serving({ updater, fence: () => true, installDir: process.cwd() }, async (base) => {
-    const { status, body } = await call(base + PATHS.update, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ version: '0.1.0-rc.8' }),
-    })
-    assert.equal(status, 200)
-    assert.equal(body.result.state, 'idle', 'the view is re-read after the start')
-    assert.deepEqual(updater.started, ['0.1.0-rc.8'])
-  })
-})
+test('restart answers 501 unwired, 200 wired, 409 when the handoff refuses', async () => {
+  const bare = harness()
+  const missing = await invoke(bare.routes, VERSION_API.restart, { method: 'POST' })
+  assert.equal(missing.status, 501)
 
-test('update rejects ranges, tags, and injection attempts without spawning', async () => {
-  const updater = fakeUpdater()
-  await serving({ updater, fence: () => true }, async (base) => {
-    for (const version of ['latest', '^0.1.0', '0.1.x', '0.1.0 && calc', '../evil', 42, null]) {
-      const { status, body } = await call(base + PATHS.update, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ version }),
-      })
-      assert.equal(status, 400, JSON.stringify(version))
-      assert.match(body.error, /one exact published version/)
-    }
-    const missing = await call(base + PATHS.update, { method: 'POST' })
-    assert.equal(missing.status, 400, 'an empty body')
-    assert.deepEqual(updater.started, [])
-  })
-})
-
-test('update reports a refused concurrent install as a conflict', async () => {
-  await serving({
-    updater: fakeUpdater({ startThrows: 'an update is already running' }),
-    fence: () => true,
-  }, async (base) => {
-    const { status, body } = await call(base + PATHS.update, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ version: '0.1.0' }),
-    })
-    assert.equal(status, 409)
-    assert.match(body.error, /already running/)
-  })
-})
-
-test('update rejects an oversized body with 413, not a server error', async () => {
-  // The cap is a fact about the request, so the status has to blame the client;
-  // a 500 would send someone reading the log looking for a host bug.
-  await serving({ updater: fakeUpdater(), fence: () => true }, async (base) => {
-    const { status, body } = await call(base + PATHS.update, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ version: '0.1.0', pad: 'x'.repeat(8192) }),
-    })
-    assert.equal(status, 413)
-    assert.match(body.error, /body too large/)
-  })
-})
-
-test('update rejects a malformed body with 400', async () => {
-  await serving({ updater: fakeUpdater(), fence: () => true }, async (base) => {
-    const { status, body } = await call(base + PATHS.update, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: '{"version": ',
-    })
-    assert.equal(status, 400)
-    assert.match(body.error, /not valid JSON/)
-  })
-})
-
-test('restart is unavailable when the composition has no restarter', async () => {
-  await serving({ updater: fakeUpdater(), fence: () => true }, async (base) => {
-    const { status, body } = await call(base + PATHS.restart, { method: 'POST' })
-    assert.equal(status, 501)
-    assert.match(body.error, /not available in this composition/)
-    const status2 = await call(base + PATHS.status)
-    assert.equal(status2.body.result.restartable, false)
-  })
-})
-
-test('restart hands back where the replacement will answer', async () => {
-  let restarts = 0
-  await serving({
-    updater: fakeUpdater(),
-    fence: () => true,
-    installDir: process.cwd(),
-    restarter: {
-      restart: () => {
-        restarts += 1
-        return { host: '127.0.0.1', port: 5173, pid: 1, launcher: '/opt/dsh/lib/bin.js', logPath: '/tmp/x.log' }
+  let refuse = false
+  const wired = harness({
+    deps: {
+      restarter: {
+        restart: () => {
+          if (refuse) throw new Error('OS-assigned port')
+          return { host: '127.0.0.1', port: 3080 }
+        },
       },
     },
-  }, async (base) => {
-    const { status, body } = await call(base + PATHS.restart, { method: 'POST' })
-    assert.equal(status, 200)
-    assert.equal(body.result.port, 5173)
-    assert.equal(restarts, 1)
-    const view = await call(base + PATHS.status)
-    assert.equal(view.body.result.restartable, true)
   })
+  const ok = await invoke(wired.routes, VERSION_API.restart, { method: 'POST' })
+  assert.equal(ok.status, 200)
+  assert.equal(ok.body.result.port, 3080)
+
+  refuse = true
+  const conflict = await invoke(wired.routes, VERSION_API.restart, { method: 'POST' })
+  assert.equal(conflict.status, 409)
 })
 
-test('a refused restart is a conflict, not a crash', async () => {
-  await serving({
-    updater: fakeUpdater(),
-    fence: () => true,
-    restarter: { restart: () => { throw new Error('restart unavailable: this host listens on an OS-assigned port') } },
-  }, async (base) => {
-    const { status, body } = await call(base + PATHS.restart, { method: 'POST' })
-    assert.equal(status, 409)
-    assert.match(body.error, /OS-assigned port/)
-  })
-})
-
-test('the notes route mounts only when the composition wires it', async () => {
-  await serving({ updater: fakeUpdater(), fence: () => true }, async (base) => {
-    const response = await fetch(base + PATHS.notes + '?version=0.1.0')
-    assert.equal(response.status, 404, 'an unwired notes path falls through to the SPA-less 404')
-  })
-})
-
-test('the notes route serves one exact version and refuses the rest', async () => {
-  const reads = []
-  await serving({
-    updater: fakeUpdater(),
-    fence: () => true,
-    repoSlug: 'deepseek-ai/deepseek-harness',
-    notes: async (repo, version) => {
-      reads.push(`${repo}@${version}`)
-      return { notes: '# changes', url: 'https://github.com/x/releases/tag/v1' }
+test('notes validates versions and maps upstream failure to 502', async () => {
+  const { routes } = harness({
+    deps: {
+      notes: async (_repo, version) => {
+        if (version === '0.9.9') return { notes: '# hi' }
+        // A version without a release is a normal miss, not an error.
+        if (version === '0.1.0') return {}
+        throw new Error('HTTP 503')
+      },
+      repoSlug: 'o/r',
     },
-  }, async (base) => {
-    const good = await call(base + PATHS.notes + '?version=0.1.0-rc.8')
-    assert.equal(good.status, 200)
-    assert.equal(good.body.result.version, '0.1.0-rc.8')
-    assert.equal(good.body.result.hasNotes, true)
-    assert.equal(good.body.result.notes, '# changes')
-    assert.deepEqual(reads, ['deepseek-ai/deepseek-harness@0.1.0-rc.8'])
-
-    for (const bad of ['latest', '0.1.x', '../evil']) {
-      const refused = await call(base + PATHS.notes + `?version=${encodeURIComponent(bad)}`)
-      assert.equal(refused.status, 400, bad)
-      assert.deepEqual(reads.length, 1, `${bad} never reached the reader`)
-    }
   })
-})
+  const bad = await invoke(routes, VERSION_API.notes, { query: '?version=latest' })
+  assert.equal(bad.status, 400)
+  const miss = await invoke(routes, VERSION_API.notes, { query: '?version=0.1.0' })
+  assert.equal(miss.status, 200)
+  assert.equal(miss.body.result.hasNotes, false)
+  const hit = await invoke(routes, VERSION_API.notes, { query: '?version=0.9.9' })
+  assert.equal(hit.body.result.notes, '# hi')
 
-test('a failed upstream notes read answers 502, blaming GitHub not the host', async () => {
-  await serving({
-    updater: fakeUpdater(),
-    fence: () => true,
-    repoSlug: 'o/r',
-    notes: async () => { throw new Error('HTTP 403') },
-  }, async (base) => {
-    const { status, body } = await call(base + PATHS.notes + '?version=1.0.0')
-    assert.equal(status, 502)
-    assert.match(body.error, /HTTP 403/)
-  })
-})
-
-test('check and status carry the ambient auto-check and rollback facts', async () => {
-  const history = {
-    rollbackTarget: '0.2.0',
-    recent: [{ at: 1, from: '0.2.0', to: '0.3.0', result: 'ok' }],
-  }
-  let autoCheckReads = 0
-  await serving({
-    updater: fakeUpdater(),
-    fence: () => true,
-    running: '0.3.0',
-    installDir: process.cwd(),
-    autoCheck: () => {
-      autoCheckReads += 1
-      return { checkedAt: 1234, updateAvailable: true, latestVersion: '0.4.0' }
+  const upstream = harness({
+    deps: {
+      notes: async () => { throw new Error('HTTP 503') },
+      repoSlug: 'o/r',
     },
-    historySummary: () => history,
-  }, async (base) => {
-    const check = await call(base + PATHS.check)
-    assert.deepEqual(check.body.result.autoCheck, { checkedAt: 1234, updateAvailable: true, latestVersion: '0.4.0' })
-    assert.deepEqual(check.body.result.rollbackTarget, '0.2.0')
-    assert.equal(check.body.result.recent.length, 1)
-
-    const status = await call(base + PATHS.status)
-    assert.equal(status.body.result.autoCheck.updateAvailable, true, 'the watchdog polls the same facts')
-    assert.equal(status.body.result.rollbackTarget, '0.2.0')
-    assert.ok(autoCheckReads >= 2, 'the getter is consulted per request, so live state is served')
   })
+  const failed = await invoke(upstream.routes, VERSION_API.notes, { query: '?version=0.9.9' })
+  assert.equal(failed.status, 502)
+})
+
+test('policy GET reflects the store; POST applies patches and reports rejects', async () => {
+  /** @type {any} */
+  let current = { ...DEFAULT_POLICY }
+  const applied = []
+  const { routes } = harness({
+    deps: {
+      policy: {
+        get: () => current,
+        set: patch => {
+          if (patch?.mode === 'bogus') throw new Error('mode must be one of off, notify, auto')
+          current = { ...current, ...patch }
+          applied.push(current)
+        },
+      },
+    },
+  })
+  const initial = await invoke(routes, VERSION_API.policy)
+  assert.equal(initial.body.result.policy.mode, 'off')
+
+  const patched = await invoke(routes, VERSION_API.policy, { method: 'POST', body: { mode: 'auto' } })
+  assert.equal(patched.status, 200)
+  assert.equal(patched.body.result.policy.mode, 'auto')
+  assert.equal(applied.length, 1)
+
+  const rejected = await invoke(routes, VERSION_API.policy, { method: 'POST', body: { mode: 'bogus' } })
+  assert.equal(rejected.status, 400)
+  assert.match(rejected.body.error, /mode/)
+
+  // One path, two methods: everything else is still refused there.
+  const wrongMethod = await invoke(routes, VERSION_API.policy, { method: 'DELETE' })
+  assert.equal(wrongMethod.status, 405)
+})
+
+test('snapshot center lists and restores through its operations', async () => {
+  const calls = []
+  const { routes } = harness({
+    deps: {
+      snapshots: {
+        list: () => [{ version: '0.4.0', usable: true }],
+        restore: version => {
+          calls.push(version)
+          return version === '0.4.0' ? { ok: true } : { ok: false, error: 'no usable snapshot of 0.0.1' }
+        },
+      },
+    },
+  })
+  const listed = await invoke(routes, VERSION_API.snapshots)
+  assert.deepEqual(listed.body.result.snapshots, [{ version: '0.4.0', usable: true }])
+
+  const badBody = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: 'x' } })
+  assert.equal(badBody.status, 400)
+
+  const failed = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.0.1' } })
+  assert.equal(failed.status, 409)
+  assert.match(failed.body.error, /no usable snapshot/)
+
+  const okRestore = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(okRestore.status, 200)
+  assert.equal(okRestore.body.result.restored, '0.4.0')
+  assert.deepEqual(calls, ['0.0.1', '0.4.0'])
+})
+
+test('restore refuses while an install is writing the tree', async () => {
+  const { routes } = harness({
+    deps: {
+      snapshots: { list: () => [], restore: () => ({ ok: true }) },
+    },
+    taskView: () => ({ state: 'running', log: '' }),
+  })
+  const res = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 409)
 })
