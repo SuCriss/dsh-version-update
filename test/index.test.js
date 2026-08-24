@@ -92,6 +92,7 @@ test('apply mounts the full core family; notes stay off without a repo slug', (t
     VERSION_API.check,
     VERSION_API.policy,
     VERSION_API.restart,
+    VERSION_API.restartCancel,
     VERSION_API.restore,
     VERSION_API.snapshots,
     VERSION_API.status,

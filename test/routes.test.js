@@ -98,7 +98,7 @@ test('the full route family registers; optional routes appear only when wired', 
   // only notes/policy/snapshots appear when their operations are wired.
   const bare = harness()
   assert.deepEqual(bare.routes.map(r => r.path).sort(), [
-    VERSION_API.check, VERSION_API.restart, VERSION_API.status, VERSION_API.update,
+    VERSION_API.check, VERSION_API.restart, VERSION_API.restartCancel, VERSION_API.status, VERSION_API.update,
   ])
 })
 

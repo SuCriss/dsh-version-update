@@ -3,6 +3,32 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.0.2]
+
+### Fixed
+
+- **A manual install whose page died mid-countdown never restarted the host.**
+  The handoff to the replacement process was browser-driven end to end: the
+  panel polled the settled install, ran its 20-second countdown, and only then
+  sent `POST /restart`. But the install had just replaced the very files the
+  browser is serving from — npm rewrites `@deepseek-ai/dsh` in place, and the
+  hashed asset URLs the open page references disappear with the old tree — so
+  the page could go blank (or a refresh 404) before the countdown finished,
+  the restart request was never sent, and the host kept running superseded
+  code with nobody left to hand the port over. The host now arms its own
+  fallback when an install settles under `restart: 'auto'`: the interactive
+  countdown gets a 30-second grace (the `MANUAL_RESTART_GRACE_MS` window),
+  then the host restarts itself even with no live page. A live panel still
+  wins — its `POST /restart` cancels the fallback and hands over immediately —
+  and arming is idempotent, so the two paths can never spawn a second detached
+  helper that would fight over the port.
+- **"稍后 / Later" now actually defers.** Previously the button only hid the
+  overlay; the host's unattended restart timer (10 s for policy-driven
+  installs) kept running and restarted the host anyway. A new
+  `POST /api/dsh-version-update/restart/cancel` route disarms the pending
+  fallback, and the panel calls it when the user dismisses an offer or cancels
+  a countdown — the update stays installed and waits for a manual restart.
+
 ## [1.0.1]
 
 First published 1.x release. 1.0.0 was tagged in the source tree but never

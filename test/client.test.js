@@ -288,6 +288,7 @@ test('install settles into a cancellable countdown; restart reloads when ready',
             restartable: true,
           } }),
       '/restart': () => json({ result: {} }),
+      '/cancel': () => json({ result: { cancelled: true } }),
     }).install()
     const controller = client.createController({ t, overlay, reload: () => { reloaded += 1 } })
 
@@ -350,6 +351,7 @@ test('restore confirms, applies, and walks the same restart flow', async (ctx) =
         task: { state: 'idle', log: '', running: '9.9.9', installed: '7.7.7', stale: true, needsRestart: true, restartable: true },
       } }),
       '/restart': () => json({ result: {} }),
+      '/cancel': () => json({ result: { cancelled: true } }),
       '/status': () => json({ result: { state: 'idle', log: '', stale: false, needsRestart: false } }),
     }).install()
     const controller = client.createController({ t, overlay, reload: () => { reloaded += 1 } })

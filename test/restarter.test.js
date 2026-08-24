@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { AUTO_RESTART_DELAY_MS, createRestarter, parseRequestedPort, resolveLauncher } from '../lib/restarter.js'
+import { AUTO_RESTART_DELAY_MS, MANUAL_RESTART_GRACE_MS, createRestarter, parseRequestedPort, resolveLauncher } from '../lib/restarter.js'
 
 /** Composition seams for one restart. */
 function harness(overrides = {}) {
@@ -35,7 +35,10 @@ function harness(overrides = {}) {
     restarter,
     spawned,
     get exited() { return exited },
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    cleanup: () => {
+      restarter.cancelPending()
+      rmSync(dir, { recursive: true, force: true })
+    },
     /** Read the payload file the helper was pointed at. */
     payload() {
       const call = spawned[0]
@@ -105,7 +108,38 @@ test('recovery arms only when the composition provides it', () => {
 
 test('restartAfterDelay swallows refusals and defaults to the auto grace period', (t) => {
   assert.equal(AUTO_RESTART_DELAY_MS >= 1000, true)
+  assert.equal(MANUAL_RESTART_GRACE_MS > AUTO_RESTART_DELAY_MS, true, 'the manual fallback outlasts the panel countdown')
   const blocked = harness({ address: () => undefined })
   t.after(blocked.cleanup)
   assert.equal(blocked.restarter.restartAfterDelay(), undefined, 'unattended path never throws')
+})
+
+test('arm is idempotent: a second handoff reuses the first result', (t) => {
+  const h = harness()
+  t.after(h.cleanup)
+  const first = h.restarter.restart()
+  const second = h.restarter.restart()
+  assert.equal(h.spawned.length, 1, 'one detached helper per process, however often restart is asked')
+  assert.deepEqual(second, first, 'the second caller gets the first handoff back')
+})
+
+test('restartAfterDelay arms once after the grace period, and the interactive route cancels it', async (t) => {
+  const h = harness()
+  t.after(h.cleanup)
+  const started = Date.now()
+  const result = h.restarter.restartAfterDelay(40)
+  assert.equal(result, undefined, 'the fallback reports nothing yet')
+  assert.equal(h.spawned.length, 0, 'no helper before the grace elapses')
+  await new Promise(resolve => setTimeout(resolve, 90))
+  assert.equal(h.spawned.length, 1, 'the fallback armed itself after the grace period')
+  assert.ok(Date.now() - started >= 40, 'the helper came only after the delay')
+})
+
+test('the interactive restart cancels a pending fallback and arms immediately', (t) => {
+  const h = harness()
+  t.after(h.cleanup)
+  h.restarter.restartAfterDelay(500)
+  const result = h.restarter.restart()
+  assert.equal(h.spawned.length, 1, 'the interactive handoff wins; no second helper')
+  assert.equal(result.pid, 111)
 })
