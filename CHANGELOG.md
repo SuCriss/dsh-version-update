@@ -3,6 +3,33 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.0.1]
+
+First published 1.x release. 1.0.0 was tagged in the source tree but never
+released, so this is the first artifact carrying the rewrite.
+
+### Fixed
+
+- **The settings panel rendered raw dictionary keys** — `policy.title`,
+  `badge.current`, `confirm.impact` and their neighbours appeared as literal
+  text instead of prose. The host locale runtime resolves a key as one whole
+  string (`dict[key]`) and never expands dotted paths, but most `zh`/`en`
+  entries were nested objects, so those lookups missed and the runtime fell
+  back — by design — to echoing the key. Both dictionaries are now flat dotted
+  keys, 105 each with identical key sets. `installDowngrade` and
+  `installDowngradeTo` are renamed to `install.downgrade` and
+  `install.downgradeTo`, matching what the panel has always requested.
+- **Unknown dist-tags and history triggers showed their key**, because
+  `t(key, { defaultValue })` is not a form the host runtime understands — its
+  `translate` interpolates `{name}` and nothing else. A small `orElse` helper
+  now supplies the fallback by comparing against the key the runtime echoes.
+- A guard test walks every key the panel asks for — literal calls plus
+  interpolated prefixes — against both dictionaries, so a re-nested entry or a
+  one-sided addition fails the suite instead of reaching a user.
+- CI's Linux legs failed on `resolveNpmCli`'s test, which passed no `env` and so
+  read the runner's ambient `npm_config_prefix` — a root the function probes by
+  design. The case now passes an explicit `env`.
+
 ## [1.0.0]
 
 A ground-up rewrite. Same plugin identity and host/browser shape, a different
