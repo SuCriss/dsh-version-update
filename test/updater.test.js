@@ -43,7 +43,10 @@ function spawnStub() {
 }
 
 test('resolveNpmCli probes node-adjacent roots then configured prefixes', () => {
-  assert.equal(resolveNpmCli({ execPath: '/nowhere/bin/node' }), undefined)
+  // Every case passes an explicit `env`. Omitting it falls through to the real
+  // process.env, where a CI runner's `npm_config_prefix` — a root this function
+  // probes BY DESIGN — resolves the runner's own npm and defeats the assertion.
+  assert.equal(resolveNpmCli({ execPath: '/nowhere/bin/node', env: {} }), undefined)
   // APPDATA layout (Windows per-user npm).
   const found = resolveNpmCli({
     execPath: '/opt/node/bin/node',
