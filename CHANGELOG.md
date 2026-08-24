@@ -3,6 +3,15 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.0.3]
+
+### Changed
+
+- **Recent activity no longer stretches the settings page.** The activity card
+  caps its list at 260 px and scrolls internally, matching the task log — the
+  page layout stays stable however many install records accumulate over months
+  of updates, instead of pushing the whole panel past one screen.
+
 ## [1.0.2]
 
 ### Fixed
