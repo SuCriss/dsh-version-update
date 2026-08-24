@@ -10,11 +10,12 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 
 /**
  * Load lib/client.js under a fake module loader and browser globals.
- * @returns {Promise<{ createController: Function; compareVersionTexts: Function; isDowngrade: Function }>} the module exports.
+ * @returns {Promise<{ createController: Function; compareVersionTexts: Function; isDowngrade: Function; dictionaries: Record<string, Record<string, string>> }>} the module exports.
  */
 async function loadClient() {
   let captured
@@ -116,6 +117,48 @@ const t = key => key
 async function flush(turns = 12) {
   for (let index = 0; index < turns; index += 1) await Promise.resolve()
 }
+
+/**
+ * Every key the panel asks for must resolve. The host locale runtime looks a
+ * key up as ONE whole string (`dict[key]`), so a dictionary nested under
+ * `policy` would leave `t('policy.title')` unresolved and the panel would
+ * render the raw key. This walks the source's own `t()` calls — literal keys
+ * plus the prefixes of interpolated ones — against both dictionaries.
+ */
+test('both dictionaries are flat and cover every key the panel asks for', async () => {
+  const client = await loadClient()
+  const source = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+
+  const literal = new Set()
+  for (const match of source.matchAll(/\b(?:t|orElse)\(\s*(?:t,\s*)?(['`])([A-Za-z0-9_.]+)\1/g)) literal.add(match[2])
+  assert.ok(literal.size > 40, 'the scan found the panel\'s t() calls')
+
+  const prefixes = new Set()
+  for (const match of source.matchAll(/\b(?:t|orElse)\(\s*(?:t,\s*)?`([A-Za-z0-9_.]*)\$\{/g)) prefixes.add(match[1])
+
+  for (const [locale, dict] of Object.entries(client.dictionaries)) {
+    for (const [key, value] of Object.entries(dict)) {
+      assert.equal(typeof value, 'string', `${locale}.${key} is a flat string, not a nested object`)
+    }
+    for (const key of literal) {
+      assert.ok(key in dict, `${locale} is missing the key ${key}`)
+    }
+    // Every interpolated family resolves for each of its known variants.
+    for (const prefix of prefixes) {
+      assert.ok(
+        Object.keys(dict).some(key => key.startsWith(prefix) && key.length > prefix.length),
+        `${locale} has no entry under the interpolated prefix ${prefix}`,
+      )
+    }
+  }
+
+  // The two locales carry the identical key set: a locale switch never blanks
+  // a field that the other locale fills.
+  assert.deepEqual(
+    Object.keys(client.dictionaries.en).sort(),
+    Object.keys(client.dictionaries.zh).sort(),
+  )
+})
 
 test('the browser version ranking mirrors the host grammar', async () => {
   const client = await loadClient()
