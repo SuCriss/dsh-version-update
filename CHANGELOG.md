@@ -3,6 +3,18 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.0.4]
+
+### Added
+
+- **Check now asks before installing.** Clicking the check button, when the
+  check finds a newer version than the installed one, opens the install
+  confirmation right away instead of leaving the user to spot the update row.
+  The silent page-load check is unaffected.
+- **Policy saves report their outcome.** Saving the policy shows a transient
+  success or failure notice under the form (dismissed automatically after a
+  few seconds), so the user always knows whether the policy was persisted.
+
 ## [1.0.3]
 
 ### Changed

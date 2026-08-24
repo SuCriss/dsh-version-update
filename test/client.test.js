@@ -207,6 +207,57 @@ test('an HTML fallback is diagnosed as not-mounted instead of HTTP 200', async (
   assert.equal(controller.getSnapshot().error, 'notMounted')
 })
 
+test('check with prompt offers an ahead update for confirmation', async () => {
+  const client = await loadClient()
+  fakeFetch({
+    '/check': () => json({ result: {
+      installed: '0.4.0',
+      installDir: '/i',
+      channels: [{ channel: 'latest', version: '0.5.0', ahead: true }],
+      versions: ['0.5.0', '0.4.0'],
+      task: { state: 'idle', log: '' },
+      lastCheck: { at: 42, updateAvailable: true, target: '0.5.0' },
+      recent: [],
+    } }),
+    '/snapshots': () => json({ result: { snapshots: [] } }),
+  }).install()
+  const controller = client.createController({ t })
+  await controller.check({ prompt: true })
+  const s = controller.getSnapshot()
+  assert.equal(s.confirm, '0.5.0', 'the ahead version is offered for confirmation')
+  assert.equal(s.status, 'ready')
+})
+
+test('check without prompt does not open a confirmation', async () => {
+  const client = await loadClient()
+  fakeFetch({
+    '/check': () => json({ result: {
+      installed: '0.4.0',
+      channels: [{ channel: 'latest', version: '0.5.0', ahead: true }],
+      task: { state: 'idle', log: '' },
+      recent: [],
+    } }),
+    '/snapshots': () => json({ result: { snapshots: [] } }),
+  }).install()
+  const controller = client.createController({ t })
+  await controller.check()
+  assert.equal(controller.getSnapshot().confirm, undefined, 'no confirm without prompt')
+})
+
+test('a successful policy save shows a transient notice', async () => {
+  const client = await loadClient()
+  fakeFetch({
+    '/policy': () => json({ result: { policy: {} } }),
+  }).install()
+  const controller = client.createController({ t })
+  await controller.savePolicy({ mode: 'auto' })
+  const s = controller.getSnapshot()
+  assert.equal(s.savingPolicy, false)
+  assert.ok(s.policyNotice !== undefined, 'a notice appeared after saving')
+  assert.equal(s.policyNotice.kind, 'ok', 'the notice reports success')
+  controller.dispose()
+})
+
 test('a rejected policy patch surfaces the host reason', async () => {
   const client = await loadClient()
   fakeFetch({
