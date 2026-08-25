@@ -3,6 +3,15 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.0.6]
+
+### Changed
+
+- **Recent activity shows the three most recent records.** The panel keeps the
+  activity list deliberately short — the newest three installs/restores — so
+  the card stays compact without an internal scrollbar. The full 50-entry
+  audit trail still lives in `history.json`; only the on-page view is trimmed.
+
 ## [1.0.5]
 
 ### Fixed
