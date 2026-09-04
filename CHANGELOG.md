@@ -3,6 +3,39 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.0.7]
+
+### Fixed
+
+- **The install log appears the moment the install starts.** `start()` used to
+  run the rollback snapshot inline: a synchronous full copy of the installation
+  (dsh ships tens of thousands of files) blocked the host's event loop, so the
+  install route answered only after the copy — often tens of seconds of a
+  frozen panel with an empty log. The snapshot and the npm spawn now run in an
+  async pipeline after `start()` answers; the single process-wide slot is held
+  across the whole preparation window, so a second install still cannot race
+  the first. The `beforeSpawn` hook becomes async (`(version, report) =>
+  Promise<void>`) and reports progress lines straight into the task log.
+- **The rollback snapshot works again.** Snapshots were keyed by the install
+  TARGET version while validity, restore, and the recovery path all re-read the
+  copied manifest and compare it with the directory name — so every fresh
+  snapshot read as damaged and was pruned immediately, leaving the snapshot
+  store empty and rollback silently unavailable. Snapshots are now keyed by the
+  version of the tree they copy (the running version).
+- **npm's quiet stretches no longer read as a hang.** While npm runs, the
+  runner measures the installation directory every few seconds and reports the
+  extraction climb (`[installing] 42s elapsed · 96.3 MB extracted`), re-arming
+  its baseline when the mid-reify reset shrinks the tree.
+
+### Changed
+
+- The snapshot copy moved from blocking `cpSync` to `fs/promises` with a
+  progress callback (`createSnapshotAsync` in `lib/snapshot.js`); the
+  synchronous `createSnapshot` remains for callers that want the old shape.
+- The panel polls a running install every 800 ms (was 1500 ms) and shows a live
+  elapsed clock next to the log toggle, so a silent npm phase still visibly
+  moves.
+
 ## [1.0.6]
 
 ### Changed

@@ -144,23 +144,30 @@ test('dispose leaves a running install alive and its slot claimed', async (t) =>
   assert.throws(() => replacement.start('1.3.0'), /already running in this host/)
 })
 
-test('beforeSpawn runs before npm and its failure degrades to a log line', async (t) => {
+test('beforeSpawn gates npm, streams progress, and its failure degrades to a log line', async (t) => {
   const spawn = spawnStub()
   /** @type {string[]} */
   const snapshotted = []
   const updater = createUpdater({
     spawnImpl: spawn,
     npmCli: '/n',
-    beforeSpawn: version => {
-      if (version === '9.9.9') throw new Error('disk full')
+    beforeSpawn: async (version, report) => {
+      report('snapshot: 50% copied\n')
       snapshotted.push(version)
     },
   })
   t.after(() => updater.dispose())
 
-  updater.start('8.8.8')
-  assert.deepEqual(snapshotted, ['8.8.8'], 'snapshot happens synchronously before spawn')
+  const running = updater.start('8.8.8')
+  assert.equal(running.state, 'running')
+  // start answers at once; npm must wait for the snapshot hook, and the hook's
+  // progress line is already visible to the panel.
+  assert.equal(spawn.calls.length, 0, 'npm waits for the snapshot to finish')
+  assert.match(running.log, /preparing to install/)
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.deepEqual(snapshotted, ['8.8.8'])
   assert.equal(spawn.calls.length, 1)
+  assert.match(updater.view().log, /snapshot: 50% copied/)
   // Settle this run so the shared process-wide slot frees for the next one.
   spawn.calls[0].child.exitCode = 0
   spawn.calls[0].child.emit('close', 0)
@@ -173,13 +180,51 @@ test('beforeSpawn runs before npm and its failure degrades to a log line', async
     beforeSpawn: () => { throw new Error('disk full') },
   })
   t.after(() => failing.dispose())
-  const task = failing.start('9.9.9')
-  assert.equal(task.state, 'running')
-  assert.match(task.log, /snapshot failed/)
+  failing.start('9.9.9')
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.match(failing.view().log, /snapshot failed/)
+  // A degraded snapshot never blocks the update: npm still runs.
+  assert.equal(failingSpawn.calls.length, 1)
   // Release the shared process-wide slot for the following tests.
   failingSpawn.calls[0].child.exitCode = 0
   failingSpawn.calls[0].child.emit('close', 0)
   await Promise.resolve()
+})
+
+test('start answers while the snapshot runs and the preparation window holds the slot', async (t) => {
+  const spawn = spawnStub()
+  let releaseSnapshot
+  const gate = new Promise(resolve => { releaseSnapshot = resolve })
+  const updater = createUpdater({
+    spawnImpl: spawn,
+    npmCli: '/n',
+    beforeSpawn: () => gate,
+  })
+  t.after(async () => {
+    // Unwind a possibly still-pending run so the process-wide slot frees.
+    releaseSnapshot()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    if (spawn.calls[0] !== undefined) {
+      const child = spawn.calls[0].child
+      if (child.exitCode === null && child.signalCode === null) {
+        child.exitCode = 0
+        child.emit('close', 0)
+      }
+    }
+    updater.dispose()
+  })
+
+  const running = updater.start('2.0.0')
+  assert.equal(running.state, 'running')
+  assert.ok(running.log.length > 0, 'the panel sees a live log from the first second')
+  assert.equal(spawn.calls.length, 0, 'npm has not started during the snapshot copy')
+  // The preparation window holds the process-wide slot: no second install.
+  assert.throws(() => updater.start('2.0.1'), /already running/)
+  // Release the snapshot; the pipeline continues to npm.
+  releaseSnapshot()
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(spawn.calls.length, 1)
+  assert.match(updater.view().log, /\$ npm install -g @deepseek-ai\/dsh@2\.0\.0/)
 })
 test('an unknown trigger or malformed version refuses without spawning', (t) => {
   const spawn = spawnStub()
