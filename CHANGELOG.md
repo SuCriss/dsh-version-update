@@ -3,6 +3,35 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.0.8]
+
+### Fixed
+
+- **A slow install is no longer killed into a half-committed global tree.**
+  The old 10-minute wall-clock cap stopped npm wherever it happened to be —
+  and npm mid-reify holds every replaced package under a retired temporary
+  name (`.name-hash`) that is only deleted when the run finishes. A kill at
+  that moment left the global installation half-committed (222 retired
+  folders under `@deepseek-ai/`, dsh itself possibly renamed away), which
+  broke the Web GUI until it was repaired by hand. The 10-minute mark is now
+  a SOFT deadline: the log notes the slowness and npm keeps running. Only a
+  hard ceiling (`INSTALL_HARD_TIMEOUT_MS`, one hour) stops a run that is
+  assumed wedged rather than working.
+
+### Added
+
+- **Half-committed trees are detected and repaired automatically.** A new
+  tree-health module scans the installation for npm's retired temporary
+  folders and for a damaged dsh manifest. At host mount a damaged tree is
+  restored from the newest usable local snapshot (no npm, no network) and
+  stale retirements are cleared; retirements younger than ten minutes are
+  left alone because they may belong to an npm orphaned by the previous host
+  and still reifying. After any FAILED install settles, the same repair runs
+  with no age threshold (skipped if a new install has already started). The
+  polling routes now carry a `tree` object (`healthy`, `manifestOk`,
+  `leftovers`, plus `restored`/`removed`/`errors` after a repair) so the
+  panel and diagnostics can see the state.
+
 ## [1.0.7]
 
 ### Fixed
@@ -36,20 +65,6 @@ surface: its entry config, its route family, and the settings page it renders.
   runner measures the installation directory every few seconds and reports the
   extraction climb (`[installing] 42s elapsed · 96.3 MB extracted`), re-arming
   its baseline when the mid-reify reset shrinks the tree.
-
-### Added
-
-- **Half-committed trees are detected and repaired automatically.** A new
-  tree-health module scans the installation for npm's retired temporary
-  folders and for a damaged dsh manifest. At host mount a damaged tree is
-  restored from the newest usable local snapshot (no npm, no network) and
-  stale retirements are cleared; retirements younger than ten minutes are
-  left alone because they may belong to an npm orphaned by the previous host
-  and still reifying. After any FAILED install settles, the same repair runs
-  with no age threshold (skipped if a new install has already started). The
-  polling routes now carry a `tree` object (`healthy`, `manifestOk`,
-  `leftovers`, plus `restored`/`removed`/`errors` after a repair) so the
-  panel and diagnostics can see the state.
 
 ### Changed
 
