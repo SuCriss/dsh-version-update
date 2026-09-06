@@ -236,14 +236,30 @@ test('an unknown trigger or malformed version refuses without spawning', (t) => 
   assert.equal(spawn.calls.length, 0)
 })
 
-test('a wedged install is killed at the ceiling and reported failed', async (t) => {
+test('the soft deadline notes the slow run but never kills npm', async (t) => {
   const spawn = spawnStub()
-  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', timeoutMs: 30 })
+  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', timeoutMs: 30, hardTimeoutMs: 10_000 })
   t.after(() => updater.dispose())
   updater.start('5.0.0')
   await new Promise(resolve => setTimeout(resolve, 80))
+  assert.equal(updater.view().state, 'running', 'soft deadline leaves the task running')
+  assert.equal(spawn.calls[0].child.killed, false, 'soft deadline must not kill npm mid-reify')
+  assert.match(updater.view().log, /still waiting/, 'the log notes the slow run and keeps waiting')
+  // npm finally finishes on its own: the run settles done.
+  spawn.calls[0].child.exitCode = 0
+  spawn.calls[0].child.emit('close', 0)
+  await Promise.resolve()
+  assert.equal(updater.view().state, 'done')
+})
+
+test('a wedged install is killed only at the hard ceiling and reported failed', async (t) => {
+  const spawn = spawnStub()
+  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', timeoutMs: 30, hardTimeoutMs: 60 })
+  t.after(() => updater.dispose())
+  updater.start('5.0.0')
+  await new Promise(resolve => setTimeout(resolve, 120))
   assert.equal(updater.view().state, 'failed')
-  assert.equal(updater.view().error, 'install timed out')
+  assert.equal(updater.view().error, 'install exceeded the hard time limit')
   assert.equal(spawn.calls[0].child.killed, true)
 })
 
