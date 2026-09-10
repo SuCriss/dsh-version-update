@@ -60,6 +60,25 @@ test('resolveLauncher prefers argv[1] and falls back to the install dir', () => 
   assert.equal(resolveLauncher({ argv: ['n'] }), undefined)
 })
 
+test('restartCommand overrides the inherited command line verbatim', () => {
+  const h = harness({
+    restartCommand: {
+      execPath: '/usr/bin/electron',
+      args: ['/opt/DeepSeek', '--dsh-port', '3080'],
+      cwd: '/opt',
+    },
+  })
+  try {
+    h.restarter.restart()
+    const payload = h.payload()
+    assert.deepEqual(payload.args, ['/opt/DeepSeek', '--dsh-port', '3080'], 'explicit args pass through untouched')
+    assert.equal(payload.execPath, '/usr/bin/electron')
+    assert.equal(payload.cwd, '/opt', 'restartCommand.cwd wins over deps.cwd')
+  } finally {
+    h.cleanup()
+  }
+})
+
 test('restart writes a complete payload and schedules the exit', () => {
   const h = harness()
   try {
