@@ -3,7 +3,7 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
-## [Unreleased]
+## [1.1.0] - 2026-09-10
 
 ### Added
 
