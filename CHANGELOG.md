@@ -3,6 +3,30 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [Unreleased]
+
+### Added
+
+- **A machine-wide update lock** (`lib/updatelock.js`). The install slot was
+  process-wide but not machine-wide: a desktop shell's host and a terminal
+  `dsh web` could run `npm install -g` against the same global tree at once.
+  `start()` now acquires a lock file (`%TEMP%\dsh-version-update.lock`) before
+  claiming the slot and `settle()` releases it. A lock whose holder is dead,
+  older than the hard-timeout ceiling, or unreadable is stolen — a leaked lock
+  never blocks updates forever; a live foreign holder turns the second install
+  into a clean refusal naming the holding pid.
+- **Post-install validation.** `npm exit 0` proves npm finished, not that dsh
+  can start. When the install directory is known, the runner now verifies the
+  manifest parses, reports the requested version, and `lib/bin.js` exists
+  before settling done; a broken tree settles failed so the host wiring
+  restores the pre-install snapshot instead of restarting into a dead install.
+- **An explicit restart command** for embedders. `createRestarter` accepts
+  `restartCommand: { execPath, args, cwd }`, which replaces the inherited
+  command line verbatim in the handoff payload — the recommended integration
+  for desktop wrappers whose argv is not a plain node invocation. The port
+  still comes from the listening address, so the replacement rebinds the
+  handed-over port even when the command predates this boot.
+
 ## [1.0.8]
 
 ### Fixed
