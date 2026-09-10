@@ -27,7 +27,7 @@
   },
   "main": "lib/index.js",
   "scripts": {
-    "test": "node --test test/protocol.test.js test/core.test.js test/policy.test.js test/snapshot.test.js test/history.test.js test/loopback.test.js test/updater.test.js test/tree-health.test.js test/scheduler.test.js test/restarter.test.js test/routes.test.js test/index.test.js test/client.test.js",
+    "test": "node --test test/protocol.test.js test/core.test.js test/policy.test.js test/snapshot.test.js test/history.test.js test/loopback.test.js test/updater.test.js test/updatelock.test.js test/tree-health.test.js test/scheduler.test.js test/restarter.test.js test/routes.test.js test/index.test.js test/client.test.js",
     "typecheck": "tsc -p tsconfig.json"
   },
   "exports": {
