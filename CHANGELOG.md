@@ -3,6 +3,29 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.1.2] - 2026-09-11
+
+### Fixed
+
+- **Silent auto-update (`mode: 'auto'`) now actually fires on its own.** Two
+  wiring gaps made the policy unreachable in practice, so every update had to
+  be triggered by hand:
+  - The scheduler's daily check was a ONE-SHOT timer that never re-armed: even
+    with a configured `checkAt`, the scheduled check ran exactly once per host
+    process lifetime and then fell silent — the panel kept showing a "next
+    check" time that had already passed and would never fire. The timer now
+    re-arms itself after every fired cycle, and the fired handle is dropped
+    immediately so `nextCheckAt` stays honest while a cycle runs.
+  - Every panel check (page load or the check button) bypassed the scheduler
+    entirely: the `/check` route read the registry itself and never consulted
+    the auto-update decision. With `checkAt` left empty — the default — the
+    scheduler literally never ran, so `mode: 'auto'` could not install
+    anything, ever. A successful registry read is now handed to the scheduler
+    (`consider`), so an `auto` policy decides on every check: it installs
+    immediately when no window is configured, or parks the finding for the
+    execution window when one is. The composition wires this through; the
+    decision failing can never fail the panel's own read.
+
 ## [1.1.1] - 2026-09-11
 
 ### Fixed
