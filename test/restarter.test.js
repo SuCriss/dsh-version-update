@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { AUTO_RESTART_DELAY_MS, MANUAL_RESTART_GRACE_MS, createRestarter, parseRequestedPort, resolveLauncher } from '../lib/restarter.js'
+import { AUTO_RESTART_DELAY_MS, MANUAL_RESTART_GRACE_MS, createRestarter, parseRequestedPort, replacementSpawnOptions, resolveLauncher } from '../lib/restarter.js'
 
 /** Composition seams for one restart. */
 function harness(overrides = {}) {
@@ -58,6 +58,23 @@ test('resolveLauncher prefers argv[1] and falls back to the install dir', () => 
   assert.equal(resolveLauncher({ argv: ['n', '/i/lib/bin.js'] }), '/i/lib/bin.js')
   assert.equal(resolveLauncher({ argv: ['n', '/other/thing.js'], installDir: '/i' }), join('/i', 'lib', 'bin.js'))
   assert.equal(resolveLauncher({ argv: ['n'] }), undefined)
+})
+
+test('replacement spawn options keep a hidden inheritable console on Windows', () => {
+  const win = replacementSpawnOptions({ platform: 'win32', cwd: '/cwd', stdio: ['ignore', 5, 6] })
+  assert.equal(win.detached, undefined, 'DETACHED_PROCESS leaves the replacement console-less, and its descendants then pop visible consoles')
+  assert.equal(win.windowsHide, true, 'CREATE_NO_WINDOW gives the replacement a real hidden console the tree inherits')
+  assert.equal(win.cwd, '/cwd')
+  assert.deepEqual(win.stdio, ['ignore', 5, 6])
+})
+
+test('replacement spawn options keep setsid daemonization on POSIX', () => {
+  for (const platform of ['darwin', 'linux']) {
+    const posix = replacementSpawnOptions({ platform, cwd: '/cwd', stdio: 'ignore' })
+    assert.equal(posix.detached, true, `${platform}: setsid remains the daemonization convention`)
+    assert.equal(posix.windowsHide, true, 'harmless no-op off Windows')
+    assert.equal(posix.cwd, '/cwd')
+  }
 })
 
 test('restartCommand overrides the inherited command line verbatim', () => {

@@ -3,6 +3,31 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [Unreleased]
+
+### Fixed
+
+- **Restarting no longer leaves the host console-less, which popped black
+  "node.exe" windows around every operation (Windows).** The relauncher used
+  `detached: true` for the replacement, which starts it under DETACHED_PROCESS
+  — a process with NO console. Everything was fine while that host only
+  served pages, but every descendant spawned later without console flags —
+  dsh's own subprocess runner per tool call, plugin code, `stdio: 'inherit'`
+  spawns — made Windows allocate a fresh console for it, and from a
+  console-less parent those allocations surface as visible black windows on
+  the desktop, one per operation, until the host was started by hand again.
+  The replacement is now spawned with plain `windowsHide` (CREATE_NO_WINDOW):
+  it owns a real but hidden console that its whole descendant tree inherits,
+  so nothing downstream ever allocates a visible one — the same console state
+  a launcher-started host already had. The price is lifetime: Node terminates
+  non-detached children when their parent exits, so the relaunch helper now
+  stays alive as the replacement's supervisor for the host's whole lifetime
+  (invisible, zero-cost) and goes away only when the host exits; POSIX keeps
+  the old setsid-and-exit contract. Verified end to end: a restart hands the
+  port over, the replacement keeps running under its supervisor, both piped
+  and inherit-stdio descendants allocate no console of their own, and killing
+  the host takes the supervisor down with it.
+
 ## [1.1.0] - 2026-09-10
 
 ### Added
