@@ -179,6 +179,52 @@ test('a registry that answers with an HTTP error does not fall back', async () =
   assert.equal(res.body.result.channels, undefined)
 })
 
+test('a successful check hands its registry facts to the auto-update decision', async () => {
+  const considered = []
+  const { routes } = harness({
+    deps: {
+      auto: async (published) => { considered.push(published) },
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {}, '0.4.0': {} } }),
+      }),
+    },
+  })
+  const res = await invoke(routes, VERSION_API.check)
+  assert.equal(res.status, 200)
+  assert.equal(considered.length, 1, 'the check reached the scheduler exactly once')
+  assert.deepEqual(considered[0].distTags, { latest: '0.5.0' })
+  assert.deepEqual(considered[0].versions, ['0.5.0', '0.4.0'])
+})
+
+test('a failed registry read never reaches the auto-update decision', async () => {
+  let calls = 0
+  const { routes } = harness({
+    deps: {
+      auto: async () => { calls += 1 },
+      fetchImpl: async () => { throw new Error('EAI_AGAIN') },
+    },
+  })
+  const res = await invoke(routes, VERSION_API.check)
+  assert.equal(res.status, 200)
+  assert.equal(calls, 0, 'without registry facts there is nothing to decide from')
+})
+
+test('a throwing auto decision cannot fail the panel check', async () => {
+  const { routes } = harness({
+    deps: {
+      auto: async () => { throw new Error('decision exploded') },
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {}, '0.4.0': {} } }),
+      }),
+    },
+  })
+  const res = await invoke(routes, VERSION_API.check)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.installed, '0.4.0')
+})
+
 test('update validates the target and always records manual trigger', async () => {
   const { routes, started } = harness()
   const bad = await invoke(routes, VERSION_API.update, { method: 'POST', body: { version: '^1.0.0' } })

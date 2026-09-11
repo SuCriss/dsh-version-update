@@ -161,3 +161,40 @@ test('dispose stops timers so late cycles do not fire', () => {
     globalThis.setTimeout = saved
   }
 })
+
+test('a fired daily check re-arms itself, so silent updates recur every day', async () => {
+  const { state, scheduler } = harness()
+  state.policy.mode = 'auto'
+  state.policy.checkAt = '03:00'
+  const armed = []
+  const originalSetTimeout = globalThis.setTimeout
+  const spy = (fn, ms, ...rest) => {
+    armed.push(fn)
+    // A far-future dummy: the re-armed timer must never actually fire here.
+    const timer = originalSetTimeout(() => {}, 10 ** 9)
+    timer.unref?.()
+    return timer
+  }
+  globalThis.setTimeout = /** @type {any} */ (spy)
+  try {
+    scheduler.start()
+    assert.equal(armed.length, 1, 'start armed the daily check exactly once')
+    armed[0]() // the scheduled moment arrives
+    // Drain every microtask the cycle and its re-arm produce.
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }], 'the scheduled cycle installed silently')
+    assert.equal(armed.length, 2, 'the fired check re-armed the next occurrence instead of falling silent')
+  } finally {
+    globalThis.setTimeout = originalSetTimeout
+    scheduler.dispose()
+  }
+})
+
+test('consider decides from pre-fetched facts, so a check can trigger the install without any timer', async () => {
+  const { state, scheduler } = harness()
+  state.policy.mode = 'auto'
+  await scheduler.consider(PUBLISHED)
+  assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }])
+  assert.equal(scheduler.view().lastCheck.updateAvailable, true)
+  assert.equal(scheduler.view().lastCheck.target, '0.5.0')
+})

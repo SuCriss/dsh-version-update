@@ -164,6 +164,28 @@ test('snapshots start empty and restore reports a missing snapshot as conflict',
   assert.equal(failed.status, 409)
 })
 
+test('a panel check feeds the scheduler, so the auto decision runs without any daily timer', async (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+  // notify: the decision records its finding but never installs — the wiring
+  // is proven without letting the composition spawn a real npm install.
+  await invoke(ctx.registered, VERSION_API.policy, { method: 'POST', body: { mode: 'notify' } })
+  const savedFetch = globalThis.fetch
+  globalThis.fetch = /** @type {any} */ (async () => ({
+    ok: true,
+    json: async () => ({ 'dist-tags': { latest: '9.9.9' }, versions: { '9.9.9': {}, '0.4.0': {} } }),
+  }))
+  try {
+    const res = await invoke(ctx.registered, VERSION_API.check)
+    assert.equal(res.status, 200)
+    assert.equal(res.body.result.lastCheck.updateAvailable, true, 'the panel check reached the scheduler')
+    assert.equal(res.body.result.lastCheck.target, '9.9.9')
+  } finally {
+    globalThis.fetch = savedFetch
+  }
+})
+
 test('disposal unregisters every route and stops the scheduler', (t) => {
   const { dataDir } = environment(t)
   const ctx = fakeCtx()
