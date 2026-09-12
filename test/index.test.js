@@ -5,11 +5,13 @@
  */
 
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { VERSION_API, DEFAULT_POLICY } from '../lib/protocol.js'
+import { createSnapshotAsync } from '../lib/snapshot.js'
 import { apply } from '../lib/index.js'
 
 /**
@@ -193,4 +195,89 @@ test('disposal unregisters every route and stops the scheduler', (t) => {
   assert.ok(ctx.registered.length > 0)
   for (const dispose of [...ctx.effects]) dispose?.()
   assert.equal(ctx.registered.length, 0, 'the routes effect removed every registration')
+})
+
+test('an unusable registry config degrades and reports, instead of failing the mount', async (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  const messages = []
+  const savedError = console.error
+  console.error = (...args) => { messages.push(args.join(' ')) }
+  try {
+    apply(ctx, { dataDir, registry: 'not a url at all' })
+  } finally {
+    console.error = savedError
+  }
+  // Before: the throw escaped apply(), so one typo in one setting took the
+  // whole route family with it and the panel reported "host routes not
+  // mounted" — sending the user to restart a host that was fine.
+  assert.ok(ctx.registered.length > 0, 'the routes still mount')
+  assert.ok(messages.some(line => line.includes('invalid registry')), 'the degradation is reported, not silent')
+  const res = await invoke(ctx.registered, VERSION_API.status)
+  assert.equal(res.status, 200)
+})
+
+test('an unwritable state directory costs persistence, not the mount', async (t) => {
+  environment(t)
+  // A regular file where the state directory should be: every write under it
+  // fails with ENOTDIR, including the first-mount policy seeding.
+  const blocker = join(tmpdir(), `vu-blocker-${String(Date.now())}`)
+  writeFileSync(blocker, 'not a directory')
+  t.after(() => rmSync(blocker, { force: true }))
+  const ctx = fakeCtx()
+  const savedError = console.error
+  const messages = []
+  console.error = (...args) => { messages.push(args.join(' ')) }
+  try {
+    apply(ctx, { dataDir: join(blocker, 'state') })
+  } finally {
+    console.error = savedError
+  }
+  assert.ok(ctx.registered.length > 0, 'the plugin still serves its routes')
+  const res = await invoke(ctx.registered, VERSION_API.policy)
+  assert.equal(res.status, 200, 'the policy is still readable from memory')
+  assert.ok(messages.some(line => line.includes('cannot write')), 'the failed seed is reported')
+})
+
+test('a restore goes through the snapshot store and back to the recorded version', async (t) => {
+  const { installDir, dataDir } = environment(t)
+  const snapshotsDir = join(dataDir, 'snapshots')
+  const made = await createSnapshotAsync({ installDir, snapshotsDir, version: '0.4.0', now: () => 1000 })
+  assert.deepEqual(made, { ok: true })
+  // An "update" moved the live tree forward.
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.9.0' }))
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
+  const res = await invoke(ctx.registered, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.result.restored, '0.4.0')
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.4.0')
+  // The rollback is in the audit trail, marked as a restore.
+  const history = JSON.parse(readFileSync(join(dataDir, 'history.json'), 'utf8'))
+  assert.equal(history.at(-1).restored, true)
+  assert.equal(history.at(-1).to, '0.4.0')
+})
+
+test('a restore yields to another host that holds the machine-wide lock', async (t) => {
+  const { installDir, dataDir } = environment(t)
+  const snapshotsDir = join(dataDir, 'snapshots')
+  assert.deepEqual(await createSnapshotAsync({ installDir, snapshotsDir, version: '0.4.0', now: () => 1 }), { ok: true })
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.9.0' }))
+
+  // A live process that is NOT this one: the staleness rules must honor it, so
+  // the composition has to refuse to swap the tree underneath it.
+  const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' })
+  t.after(() => { other.kill() })
+  const lockPath = join(dataDir, 'update.lock')
+  writeFileSync(lockPath, JSON.stringify({ pid: other.pid, at: Date.now(), token: 'foreign' }), 'utf8')
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath })
+  const res = await invoke(ctx.registered, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 409)
+  assert.match(res.body.error, /machine-wide update lock/)
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.9.0', 'the other host\'s tree is untouched')
+  // The refusal left the foreign lock exactly where it was.
+  assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).token, 'foreign')
 })

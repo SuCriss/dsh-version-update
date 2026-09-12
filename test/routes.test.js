@@ -387,3 +387,49 @@ test('restore refuses while an install is writing the tree', async () => {
   const res = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
   assert.equal(res.status, 409)
 })
+
+test('an async restore is awaited, and a contended lock answers 409 not 500', async () => {
+  let releaseHeld
+  const held = new Promise(resolve => { releaseHeld = resolve })
+  const { routes } = harness({
+    deps: {
+      snapshots: {
+        list: () => [],
+        // The composition's restore is asynchronous: it takes the machine-wide
+        // lock and copies the tree off the event loop. The route must await it —
+        // answering early would tell the panel a rollback happened that has
+        // not, and the reply would carry a stale task view.
+        restore: async (version) => {
+          if (version === '0.4.0') await held
+          return version === '0.4.0'
+            ? { ok: true }
+            : { ok: false, error: 'another host holds the machine-wide update lock (pid 7); try again once it finishes' }
+        },
+      },
+    },
+  })
+  const pending = invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  await new Promise(resolve => setTimeout(resolve, 5))
+  const refused = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.0.9' } })
+  releaseHeld?.()
+  const ok = await pending
+  assert.equal(ok.status, 200)
+  assert.equal(ok.body.result.restored, '0.4.0')
+  assert.equal(refused.status, 409, 'a lock contention is the client retrying, not a host failure')
+  assert.match(refused.body.error, /machine-wide update lock/)
+})
+
+test('the restart cancel is a POST-only route, and the panel defers with POST', async () => {
+  let cancelled = 0
+  const { routes } = harness({ deps: { restarter: { restart: () => ({}), cancelPending: () => { cancelled += 1 } } } })
+  // The browser half can only disarm the host fallback through POST: a deferral
+  // that reaches this route as a GET answers 405, is swallowed by the caller's
+  // catch, and the host restarts anyway out from under a page that said later.
+  const wrong = await invoke(routes, VERSION_API.restartCancel, { method: 'GET' })
+  assert.equal(wrong.status, 405)
+  assert.equal(cancelled, 0, 'a refused method must not disarm anything')
+  const right = await invoke(routes, VERSION_API.restartCancel, { method: 'POST' })
+  assert.equal(right.status, 200)
+  assert.deepEqual(right.body.result, { cancelled: true })
+  assert.equal(cancelled, 1)
+})
