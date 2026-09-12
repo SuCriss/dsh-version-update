@@ -433,6 +433,167 @@ test('install settles into a cancellable countdown; restart reloads when ready',
   }
 })
 
+test('a dropped poll keeps following the install instead of ending it', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    let mode = 'running'
+    const fetch = fakeFetch({
+      '/update': () => json({ result: { state: 'running', version: '9.9.9', log: '' } }),
+      '/status': () => {
+        if (mode === 'hiccup') throw new Error('Failed to fetch')
+        return json({ result: { state: 'running', version: '9.9.9', log: 'npm still working' } })
+      },
+    })
+    fetch.install()
+    const controller = client.createController({ t, overlay })
+    await controller.startUpdate('9.9.9')
+
+    mode = 'hiccup'
+    ctx.mock.timers.tick(1000)
+    await flush()
+    let snap = controller.getSnapshot()
+    // One refused request used to stop the follow-up entirely: busy cleared,
+    // the error line blaming the UPDATE for a momentary fetch failure, and the
+    // log — the one thing worth watching mid-install — going dead.
+    assert.equal(snap.busy, true, 'a hiccup does not hand the buttons back')
+    assert.equal(snap.error, undefined, 'a dropped fetch is not the install failing')
+
+    mode = 'running'
+    ctx.mock.timers.tick(1000)
+    await flush()
+    snap = controller.getSnapshot()
+    assert.equal(snap.task.log, 'npm still working', 'polling carried on to the next answer')
+    assert.equal(snap.busy, true)
+
+    // A tolerated miss is also forgotten, not remembered as a pending failure:
+    // two hiccups with a good poll between them must not add up to giving up.
+    mode = 'hiccup'
+    ctx.mock.timers.tick(1000)
+    await flush()
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.equal(controller.getSnapshot().error, undefined, 'two misses in a row are still tolerated')
+    // The third one is the limit, and then it is reported as what it is: the
+    // host stopped answering, not the install failing.
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.equal(controller.getSnapshot().busy, false)
+    assert.equal(controller.getSnapshot().error, 'Failed to fetch')
+    const polls = fetch.calls.filter(call => call.path.endsWith('/status')).length
+    ctx.mock.timers.tick(5000)
+    await flush()
+    assert.equal(fetch.calls.filter(call => call.path.endsWith('/status')).length, polls, 'a stopped follow-up stays stopped')
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
+test('an absent host half is reported at once, not retried into silence', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    fakeFetch({
+      '/update': () => json({ result: { state: 'running', version: '9.9.9', log: '' } }),
+      // The SPA fallback shape: the plugin is installed but its host half never
+      // mounted, which no number of retries will change.
+      '/status': () => htmlFallback(),
+    }).install()
+    const controller = client.createController({ t, overlay })
+    await controller.startUpdate('9.9.9')
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.equal(controller.getSnapshot().busy, false, 'the panel does not stay locked on a host that is not there')
+    assert.equal(controller.getSnapshot().error, t('notMounted'), 'the absence is named, not invented')
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
+test('a restart asked for twice is one request to the host', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    let reloaded = 0
+    const fetch = fakeFetch({
+      // The host answers once and then exits; a second POST would be the page
+      // asking a process that is already gone.
+      '/restart': () => json({ result: {} }),
+      '/cancel': () => json({ result: { cancelled: true } }),
+      '/status': () => json({ result: { state: 'done', log: '', stale: true, needsRestart: true, restartable: true } }),
+    })
+    fetch.install()
+    const controller = client.createController({ t, overlay, reload: () => { reloaded += 1 } })
+    const first = controller.restart('9.9.9')
+    const second = controller.restart('9.9.9')
+    await flush()
+    assert.equal(fetch.hit('POST', '/restart'), 1, 'the second intent is dropped, not queued')
+    assert.equal(overlay.last().body, t('restart.waiting'), 'the page is waiting on one handoff')
+    ctx.mock.timers.tick(4000)
+    await flush()
+    assert.equal(reloaded, 0, 'a host that never comes back is not reloaded into')
+    await first
+    void second
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
+test('a restart request that never answered counts as a host already gone', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    const fetch = fakeFetch({
+      // An aborted fetch is what a request timeout looks like: the host may
+      // well have taken the hint and exited, so the page must go on watching
+      // rather than report a failure it cannot distinguish from a real refusal.
+      '/restart': () => { throw new Error('The operation was aborted due to timeout') },
+      '/cancel': () => json({ result: { cancelled: true } }),
+      '/status': () => json({ result: { state: 'done', log: '', stale: true, needsRestart: true, restartable: true } }),
+    })
+    fetch.install()
+    const controller = client.createController({ t, overlay, reload: () => {} })
+    const waiting = controller.restart('9.9.9')
+    await flush()
+    assert.equal(overlay.last().body, t('restart.waiting'), JSON.stringify(overlay.shown))
+    assert.notEqual(overlay.last().body, t('restart.failed'), 'no failure was declared')
+    assert.equal(
+      globalThis.window.sessionStorage.getItem('dsh-version-update:awaiting-restart'),
+      '9.9.9',
+      'the watchdog survives a reload of this page',
+    )
+    void waiting
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
+test('a refused restart is reported as a refusal, not a wait', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    fakeFetch({
+      '/restart': () => json({ error: 'restart unavailable: the listening address is unknown' }, 409),
+      '/cancel': () => json({ result: { cancelled: true } }),
+      '/status': () => json({ result: { state: 'done', log: '', stale: true, needsRestart: true, restartable: true } }),
+    }).install()
+    const controller = client.createController({ t, overlay })
+    await controller.restart('9.9.9')
+    assert.equal(overlay.last().body, t('restart.failed'))
+    assert.equal(controller.getSnapshot().restarting, false, 'the panel hands the choice back')
+    // The refusal must not leave a marker behind: a reload would then sit in a
+    // watchdog waiting for a restart that was never armed.
+    assert.equal(globalThis.window.sessionStorage.getItem('dsh-version-update:awaiting-restart'), null)
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
 test('restore confirms, applies, and walks the same restart flow', async (ctx) => {
   // Module load first; mock timers take over only the test's clock.
   const client = await loadClient()
