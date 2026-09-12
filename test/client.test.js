@@ -17,7 +17,7 @@ import { test } from 'node:test'
  * Load lib/client.js under a fake module loader and browser globals.
  * @returns {Promise<{ createController: Function; compareVersionTexts: Function; isDowngrade: Function; dictionaries: Record<string, Record<string, string>> }>} the module exports.
  */
-async function loadClient() {
+async function loadClient(reactImpl) {
   let captured
   globalThis.window = {
     __ModuleLoader__: { load: (options) => { captured = options.factory } },
@@ -25,7 +25,7 @@ async function loadClient() {
     location: { reload: () => {} },
     matchMedia: () => ({ matches: false }),
   }
-  const react = {
+  const react = reactImpl ?? {
     createElement: (type, props, ...children) => ({ type, props, children }),
     useRef: initial => ({ current: initial }),
     useState: initial => [initial, () => {}],
@@ -131,6 +131,131 @@ const t = key => key
 async function flush(turns = 12) {
   for (let index = 0; index < turns; index += 1) await Promise.resolve()
 }
+
+/**
+ * A React stand-in with real hook semantics for ONE component, so a render can
+ * be driven by hand. State persists across the renders this harness performs and
+ * `useEffect` re-runs exactly when its dependency array changes by identity —
+ * which is the mechanism an unsaved form edit lives or dies by.
+ */
+function fakeHooks() {
+  /** @type {{ has: boolean; value: unknown; deps: unknown[] | undefined }[]} */
+  const slots = []
+  let cursor = 0
+  /** Claim the next hook slot, in call order. */
+  const next = () => {
+    const at = cursor
+    cursor += 1
+    if (slots[at] === undefined) slots[at] = { has: false, value: undefined, deps: undefined }
+    return slots[at]
+  }
+  const depsChanged = (before, after) => before === undefined
+    || after === undefined
+    || before.length !== after.length
+    || before.some((item, index) => !Object.is(item, after[index]))
+  /** Set when a state write happened during a render, so it needs another. */
+  let dirty = false
+  return {
+    react: {
+      createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+      useRef: (initial) => {
+        const slot = next()
+        if (!slot.has) { slot.has = true; slot.value = { current: initial } }
+        return slot.value
+      },
+      useState: (initial) => {
+        const slot = next()
+        if (!slot.has) { slot.has = true; slot.value = typeof initial === 'function' ? initial() : initial }
+        return [slot.value, (update) => {
+          dirty = true
+          slot.value = typeof update === 'function' ? update(slot.value) : update
+        }]
+      },
+      useEffect: (fn, deps) => {
+        const slot = next()
+        if (depsChanged(slot.deps, deps)) { slot.deps = deps; fn() }
+      },
+    },
+    /** Render the component until it settles, and return that tree. */
+    render(component, props) {
+      let tree = undefined
+      for (let pass = 0; pass < 4; pass += 1) {
+        cursor = 0
+        dirty = false
+        tree = component(props)
+        if (!dirty) break
+      }
+      return tree
+    },
+  }
+}
+
+/**
+ * Depth-first search over a rendered tree, descending into prop values as well
+ * as children: this panel hands controls to fields through `control` props, so a
+ * children-only walk would miss every input in the form.
+ * @param {unknown} node - the node to search from.
+ * @param {(node: any) => boolean} predicate - what counts as a hit.
+ * @param {Set<object>} [seen] - cycle guard.
+ * @returns {any} the first matching node, or undefined.
+ */
+function findNode(node, predicate, seen = new Set()) {
+  if (typeof node !== 'object' || node === null || seen.has(node)) return undefined
+  seen.add(node)
+  if (predicate(node)) return node
+  const children = Array.isArray(node.children) ? node.children.flat() : []
+  const queue = [...children, ...Object.values(node.props ?? {})]
+  for (const child of queue) {
+    const hit = findNode(child, predicate, seen)
+    if (hit !== undefined) return hit
+  }
+  return undefined
+}
+
+test('the policy form keeps an unsaved edit, shows the derived hint, and resets on a real answer', async () => {
+  const hooks = fakeHooks()
+  const client = await loadClient(hooks.react)
+  assert.equal(typeof client.PolicyCard, 'function', 'the form is reachable for this test')
+  // The policy object the panel passes is the controller's own state object, so
+  // it keeps its identity across renders and changes only when the host answers.
+  const policy = { mode: 'off', track: { kind: 'tag', tag: 'latest' }, window: null, restart: 'ask', checkAt: null }
+  const props = {
+    t, policy, nextCheckHint: undefined, saving: false, error: undefined, notice: undefined,
+    onSave: () => {}, onRefresh: () => {},
+  }
+  /** The first dropdown of the form, which is the mode selector. */
+  const modeSelect = (tree) => {
+    const node = findNode(tree, candidate => candidate?.props?.options !== undefined)
+    assert.ok(node !== undefined, 'a dropdown was rendered')
+    return node.props
+  }
+  /** The next-check hint text, or undefined when the form shows none. */
+  const hint = (tree) => {
+    const node = findNode(tree, candidate => candidate?.props?.className === 'dshvu_hint')
+    return node === undefined ? undefined : node.children[0]
+  }
+
+  let tree = hooks.render(client.PolicyCard, props)
+  assert.equal(modeSelect(tree).value, 'off')
+
+  // An edit, then a re-render that changed nothing about the policy (a poll
+  // landed, another card repainted): a half-typed form is the user's work, and no
+  // unrelated render may throw it away.
+  modeSelect(tree).onChange('auto')
+  tree = hooks.render(client.PolicyCard, props)
+  assert.equal(modeSelect(tree).value, 'auto', 'an unsaved edit survived an unrelated render')
+
+  // The schedule hint updates on that same stable policy object. It used to
+  // travel INSIDE the policy, which is exactly why the form had to be re-fed a
+  // fresh object every render — and why every render cost the user their edit.
+  tree = hooks.render(client.PolicyCard, { ...props, nextCheckHint: 'next: 04:00' })
+  assert.equal(hint(tree), 'next: 04:00', 'the derived hint is not held hostage by the draft')
+  assert.equal(modeSelect(tree).value, 'auto', 'and showing it did not cost the edit')
+
+  // A genuine host answer (a save, or a refresh) replaces the draft, as designed.
+  tree = hooks.render(client.PolicyCard, { ...props, policy: { ...policy, mode: 'notify' } })
+  assert.equal(modeSelect(tree).value, 'notify', 'a real policy change wins over the draft')
+})
 
 /**
  * Every key the panel asks for must resolve. The host locale runtime looks a
