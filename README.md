@@ -93,8 +93,8 @@ dsh plugin --profile web add github:SuCriss/dsh-version-update
 ## 开发
 
 ```sh
-npm test          # node:test，130 个用例覆盖协议/域逻辑/路由/组装/浏览器控制器
+npm test          # node:test，143 个用例覆盖协议/域逻辑/路由/组装/浏览器控制器/重启助手
 npm run typecheck # tsc --checkJs strict，无构建产物的类型安全
 ```
 
-测试刻意覆盖了几类容易腐化的契约：浏览器端 semver 镜像与 host 排序的一致性、策略归一化的逐字段回退、快照元数据校验与剪枝顺序、单槽位跨 fiber 重载的排他性、mock 时钟下的倒计时/watchdog 链路。
+测试刻意覆盖了几类容易腐化的契约：浏览器端 semver 镜像与 host 排序的一致性、策略归一化的逐字段回退、快照元数据校验与剪枝顺序、单槽位跨 fiber 重载的排他性、mock 时钟下的倒计时/watchdog 链路、机器锁记录的所有权校验（release 只能删掉自己那条）、泊车中的自动更新必然存在下一次唤醒、重启助手两段等待各自的预算与可拨测的探针地址，以及降级不得伪装成结论（registry 读不到时不许说"已是最新"）。

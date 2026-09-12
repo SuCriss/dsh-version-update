@@ -3,6 +3,59 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.1.4] - 2026-09-12
+
+### Fixed
+
+- **A parked silent update could miss its window and then never wake again.** The
+  window timer fired 50 ms BEFORE the opening it was waiting for, and the wake
+  re-checked the window against the wall clock in whole minutes — at
+  `03:59:59.950` the minute is still 239, so the wake declined the very window it
+  existed for and armed nothing further. With a daily `checkAt` the finding was
+  retried the next day; without one, it was simply gone. The wake now fires just
+  after the boundary, and every way out of it leaves a wake armed: a window that
+  moved while the timer sat armed waits for the next opening, and a slot still
+  busy (a manual install, or another host holding the machine-wide lock) comes
+  back in a minute instead of a day. That busy case with **no** window configured
+  was worse — arming a wake for a window that does not exist arms nothing at all.
+- **A slow host exit could eat the restart handoff.** The detached helper waits
+  for two things in sequence — the old process gone, then the port it held
+  released — and both waits shared one deadline. A host that spent most of the
+  budget dying left the port wait whatever remained, and when that ran out the
+  helper gave up on a handoff that was about to succeed: no replacement at all,
+  and the machine stays down until someone starts it by hand. Each wait now gets
+  its own budget.
+- **A host bound to a wildcard address could be rolled back for being alive.** The
+  restart payload carries where the host LISTENED, and `0.0.0.0` / `[::]` are not
+  addresses anything can be dialled as; the helper's port probes read that as an
+  idle port, so the replacement started over a live server, and with recovery
+  armed a healthy new host was rolled back to the previous version for never
+  answering a probe that could never connect. Probes now go to loopback whenever
+  the bind address is a wildcard, and stay on the real address when it is one.
+- **One dropped request ended the panel's follow-up of a running install.** A
+  single refused `/status` cleared `busy`, printed the fetch failure as though the
+  update itself had failed, and killed the log the user was watching mid-install.
+  Misses are now counted (three in a row, reset by any answer). The absence that
+  is genuinely not a hiccup — the plugin's host half never mounted — is still
+  reported at once, since retrying that only hides it.
+- **A restart could be asked for twice, and a request that never answered froze
+  the page forever.** The countdown expiring and a click on "Restart now" are the
+  same intent arriving twice; the second POST goes to a process already on its way
+  out, and the watchdog loop ran twice on one page. In-flight is now state of its
+  own, released only when the handoff is refused outright or the wait gives up.
+  Requests also carry a deadline, and an aborted one is classified the way a
+  dropped connection is — the host may have taken the hint and exited — so the
+  page keeps watching instead of declaring a failure it cannot tell from a
+  refusal.
+
+### Tests
+
+The relaunch helper has end-to-end coverage for the first time: it is run as a
+real process against a real payload (with shortened budgets through a field only
+tests write), covering the two budgets, a rollback that fires when a replacement
+never answers, a healthy replacement left alone, and the payload being consumed so
+a stale file can never relaunch anything later. Suite: 143 cases.
+
 ## [1.1.3] - 2026-09-12
 
 ### Fixed

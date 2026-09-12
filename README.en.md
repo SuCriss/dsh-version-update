@@ -93,8 +93,8 @@ Runtime behavior (mode, tracking, window, schedule) lives in the policy file edi
 ## Development
 
 ```sh
-npm test          # node:test — 130 cases across protocol/domain/routes/composition/browser controller
+npm test          # node:test — 143 cases across protocol/domain/routes/composition/browser controller/relaunch helper
 npm run typecheck # tsc --checkJs strict — type safety without a build step
 ```
 
-The suite deliberately covers the contracts most likely to rot: agreement between the browser semver mirror and the host ranking, per-field fallback in policy normalization, snapshot metadata validation and prune ordering, process-wide single-slot exclusivity across fiber reloads, and the countdown/watchdog chain under mocked clocks.
+The suite deliberately covers the contracts most likely to rot: agreement between the browser semver mirror and the host ranking, per-field fallback in policy normalization, snapshot metadata validation and prune ordering, process-wide single-slot exclusivity across fiber reloads, the countdown/watchdog chain under mocked clocks, machine-lock ownership (a release may only remove the record it still holds), the invariant that a parked auto update always has a next wake armed, the relaunch helper's two independent budgets and its dialable probe address, and the rule that a degraded read may never be presented as a conclusion.
