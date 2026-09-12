@@ -42,6 +42,26 @@ function harness(overrides = {}) {
   return { state, scheduler, updater }
 }
 
+/**
+ * Replace the timer queue with a recording one: armed callbacks never fire on
+ * their own, the test fires them by hand after moving the fake clock.
+ * @returns {{ armed: { callback: () => void; ms: number }[]; restore: () => void }} the recorder.
+ */
+function spyTimers() {
+  /** @type {{ callback: () => void; ms: number }[]} */
+  const armed = []
+  const original = globalThis.setTimeout
+  globalThis.setTimeout = /** @type {any} */ ((/** @type {Function} */ callback, /** @type {number} */ ms) => {
+    armed.push({ callback: () => callback(), ms })
+    // Unreffed on purpose: a far-future dummy must never hold the test process
+    // open if a case forgets to dispose its scheduler.
+    const dummy = original(() => {}, 10 ** 9)
+    dummy.unref?.()
+    return dummy
+  })
+  return { armed, restore: () => { globalThis.setTimeout = original } }
+}
+
 test('mode off and notify record findings but never install', async () => {
   for (const mode of ['off', 'notify']) {
     const { state, scheduler } = harness()
@@ -89,6 +109,85 @@ test('a parked finding installs when beginAutoInstall succeeds after a refusal',
   await scheduler.runCycle()
   assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }])
   assert.equal(scheduler.view().pendingAuto, undefined)
+})
+
+test('the window wake fires after the opening, never a hair before it', async () => {
+  let clock = new Date('2026-03-01T03:59:00')
+  const { state, scheduler } = harness({ now: () => clock })
+  state.policy = { ...DEFAULT_POLICY, mode: 'auto', window: { start: '04:00', end: '05:00' } }
+  const spy = spyTimers()
+  try {
+    scheduler.start()
+    await scheduler.consider(PUBLISHED)
+    const wake = spy.armed.at(-1)
+    assert.ok(wake !== undefined, 'parking the finding armed a wake')
+    // The old jitter fired the wake 50 ms BEFORE the opening. The wake then
+    // re-reads the wall clock in whole minutes to be sure the window is open,
+    // and 03:59:59.950 is still minute 239 — it declined the very window it
+    // existed for, and nothing armed another one.
+    assert.ok(wake.ms >= 60_000, `the wake waits for the opening, got ${wake.ms}ms`)
+    clock = new Date('2026-03-01T04:00:00.25')
+    wake.callback()
+  } finally {
+    spy.restore()
+    scheduler.dispose()
+  }
+  assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }], 'the parked finding installed on the opening')
+  assert.equal(scheduler.view().pendingAuto, undefined, 'a delivered finding stops being parked')
+})
+
+test('a parked finding the slot refused keeps a wake armed', async () => {
+  const { state, scheduler } = harness()
+  // No execution window at all: the refusal has no opening to wait for, so a
+  // wake that is not armed simply loses the update until the next check — and
+  // with no checkAt configured, there is no next check.
+  state.policy = { ...DEFAULT_POLICY, mode: 'auto' }
+  state.refuse = true
+  const spy = spyTimers()
+  try {
+    scheduler.start()
+    await scheduler.consider(PUBLISHED)
+    const retry = spy.armed.at(-1)
+    assert.ok(retry !== undefined, 'a refused auto install is not silently dropped')
+    assert.equal(scheduler.view().pendingAuto?.target, '0.5.0')
+    state.refuse = false
+    retry.callback()
+    assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }], 'the retry delivered it')
+    assert.equal(scheduler.view().pendingAuto, undefined)
+  } finally {
+    spy.restore()
+    scheduler.dispose()
+  }
+})
+
+test('a wake that lands outside its window waits for the next opening', async () => {
+  let clock = new Date('2026-03-01T04:00:00')
+  const { state, scheduler } = harness({ now: () => clock })
+  state.policy = { ...DEFAULT_POLICY, mode: 'auto', window: { start: '04:00', end: '05:00' } }
+  const spy = spyTimers()
+  try {
+    scheduler.start()
+    clock = new Date('2026-03-01T03:00:00')
+    await scheduler.consider(PUBLISHED)
+    const wake = spy.armed.at(-1)
+    assert.ok(wake !== undefined)
+    // The policy moved the window while the timer sat armed.
+    state.policy.window = { start: '09:00', end: '10:00' }
+    clock = new Date('2026-03-01T04:00:00')
+    wake.callback()
+    assert.deepEqual(state.started, [], '04:00 is no longer inside the window')
+    const next = spy.armed.at(-1)
+    assert.notEqual(next, wake, 'the stale wake re-armed instead of ending the chain')
+    assert.ok(next.ms > 4 * 60 * 60 * 1000, `the new wake waits for 09:00, got ${next.ms}ms`)
+    assert.equal(scheduler.view().pendingAuto?.target, '0.5.0', 'the finding is still parked')
+    // And when 09:00 arrives, it goes in.
+    clock = new Date('2026-03-01T09:00:00')
+    next.callback()
+    assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }])
+  } finally {
+    spy.restore()
+    scheduler.dispose()
+  }
 })
 
 test('tracking kinds decide differently over the same registry facts', async () => {
