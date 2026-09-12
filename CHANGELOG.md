@@ -3,6 +3,84 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.1.3] - 2026-09-12
+
+### Fixed
+
+- **"Later" in the restart dialog did not defer the restart — the host restarted
+  anyway.** The cancel call passed no body, so the browser sent it as a GET, the
+  POST-only route answered 405, and the caller's `catch {}` read that as "there
+  was nothing pending". A fallback restart the host had armed on its own (policy
+  `restart: 'auto'`, or a restart requested from a second tab) stayed armed and
+  fired on its own schedule: the machine went into the new version under a panel
+  that had just promised it would not. The cancel is now an explicit empty POST,
+  the *offered* (not armed) restart defers through the same disarm path, and the
+  browser tests' fetch double records request methods — a deferral arriving as a
+  GET can no longer pass for one.
+- **Install progress could not move off 100 %.** The snapshot copy reported
+  `{ phase, files, bytes, ...total }`, spreading the measured TOTAL over its own
+  live counts: every tick's `bytes` *was* the total and `totalBytes` never
+  arrived at all, so the percentage the panel renders had exactly one value it
+  could ever compute. The totals now ride along as their own fields beside the
+  live counts, and the contract is asserted against a fresh `measureTree` of the
+  very tree being copied.
+- **The panel claimed "already up to date" when it could not read the
+  registry.** A degraded `/check` answers with `publishedError` and NO channels
+  at all, so "nothing is ahead" was an empty list proving nothing — the one claim
+  the data could not support, shown in the one sentence users act on. The verdict
+  is now a named, testable function that says it cannot tell instead
+  (`未能读取发布信息` / "Release information could not be read"), present in both
+  dictionaries.
+- **One bad `registry` value unmounted the whole plugin.** The registry is
+  normalized at mount, and a value that is not an absolute http(s) URL threw out
+  of `apply()`: the settings page reported "host routes are not mounted" and sent
+  the user to restart a host that was otherwise fine, while the real problem was
+  a typo in one field. The entry schema rejects the shape up front (the message
+  attaches to the field), and a value that still escapes normalization falls back
+  to the default registry with a loud `console.error`. An unwritable state
+  directory degrades the same way — persistence fails, the mount survives — and a
+  policy now becomes effective only after it is on disk, so memory and disk
+  cannot disagree about what is running.
+- **The machine-wide update lock could be deleted by a run that no longer held
+  it.** Lock records named only their pid, and `release()` removed whatever was in
+  the file. A fiber reload leaves the previous runner's child listeners attached,
+  so the orphan's late settlement unlocked the lock the NEWER run had taken —
+  after which a second host was free to run `npm install -g` against a tree two
+  of them were writing. Records carry a token now, and release deletes only while
+  it still owns the record; the preparation claim is a monotonic token for the
+  same reason, and slot, claim, and lock all go free through one
+  identity-checked path.
+- **A refused start left the machine locked for an hour.** The lock was acquired
+  before the npm CLI and the registry were validated, so every start that never
+  spawned anything — a bad `registry`, an install already running — still left a
+  lock file behind that other hosts honored until the maximum age (one hour)
+  expired. Validation comes first now, and a refusal leaves nothing.
+- **Killing a wedged npm freed the tree before npm had stopped writing it.** The
+  hard ceiling killed the child and settled the task in the same tick, releasing
+  slot and lock while the killed process was still mid-rename. The task still
+  reports failed at once (the panel must not keep saying "running"), but the slot
+  and the lock stay claimed until the child reports its exit, bounded by a
+  five-second grace. `updater.busy()` exposes the wider question anything
+  touching the tree has to answer first — a live npm, a snapshot copy not yet
+  handed over, or a killed npm not yet reaped — and the post-failure repair pass
+  defers on it and on the lock, so it can no longer restore the tree a second host
+  is installing into.
+- **A snapshot restore could overwrite the tree while an install was writing it,
+  and froze the host while doing so.** The panel's restore path took no lock (it
+  only checked whether *this* host had a task running) and copied the tree back
+  with synchronous recursive IO, blocking the event loop — every route, the
+  polling panel, any live session — for its whole duration. Restores now contend
+  on the same machine-wide lock an install holds, a contended lock answers 409
+  with a retry hint instead of 500, the swap itself runs off the event loop and
+  leaves nothing renamed-aside on either outcome, and the route awaits it — a
+  reply can no longer announce a rollback that has not happened. A restore whose
+  copy fails puts the previous tree back and names the directory it could not
+  clear.
+
+The suite covers each of the above (130 cases), and no longer acquires — or is
+refused by — the machine-wide lock real hosts share: the updater tests contend on
+a temporary file of their own, and the composition tests name their own.
+
 ## [1.1.2] - 2026-09-11
 
 ### Fixed

@@ -58,9 +58,10 @@ Three halves in one package:
   - `POST /update` — `{version}` starts one install (trigger always recorded as manual)
   - `GET /status` — task view (`running`/`stale`/`needsRestart`/`restartable`) + ambient
   - `POST /restart` — three-step handoff
+  - `POST /restart/cancel` — disarm a pending restart (what the panel's "Later" calls; POST only, GET answers 405)
   - `GET /notes?version=` — GitHub release notes (mounted when enabled and a repo is known)
   - `GET|POST /policy` — read / patch the policy; every rejected field is named in a 400
-  - `GET /snapshots`, `POST /restore` — list & restore (refused while an install runs)
+  - `GET /snapshots`, `POST /restore` — list & restore; a restore contends for the same machine-wide lock an install holds, so a busy tree in this host or another answers 409
 - **Browser half** (`lib/client.js`, exports `./client`): dictionaries, the settings page (status / policy form / versions / task log / snapshots / history), nav glyph marker, restart watchdog.
 - **Detached relaunch helper** (`lib/relaunch.js`): waits for pid exit + port release, starts the replacement verbatim; optionally stays alive to snapshot-recover an unreachable replacement.
 
@@ -92,7 +93,7 @@ Runtime behavior (mode, tracking, window, schedule) lives in the policy file edi
 ## Development
 
 ```sh
-npm test          # node:test — 83 cases across protocol/domain/routes/composition/browser controller
+npm test          # node:test — 130 cases across protocol/domain/routes/composition/browser controller
 npm run typecheck # tsc --checkJs strict — type safety without a build step
 ```
 
