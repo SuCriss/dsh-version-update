@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { VERSION_API, DEFAULT_POLICY } from '../lib/protocol.js'
+import { DEFAULT_REGISTRY } from '../lib/core.js'
 import { makeRoutes } from '../lib/routes.js'
 
 /** A response double recording one answer. */
@@ -133,9 +134,11 @@ test('check returns local facts plus the published view and ambient fields', asy
 })
 
 test('a failing registry read degrades check instead of failing it', async () => {
+  let served
   const { routes } = harness({
     deps: {
       fetchImpl: async () => { throw new Error('EAI_AGAIN') },
+      served: registry => { served = registry },
     },
   })
   const res = await invoke(routes, VERSION_API.check)
@@ -144,10 +147,15 @@ test('a failing registry read degrades check instead of failing it', async () =>
   assert.match(res.body.result.publishedError ?? '', /EAI_AGAIN/)
   assert.equal(res.body.result.channels, undefined)
   assert.equal(res.body.result.installed, '0.4.0')
+  // Nothing answered, so nothing may be remembered as the source of a read: an
+  // install must not inherit a registry from a check that failed.
+  assert.equal(served, undefined)
 })
 
 test('a network-layer registry failure falls back to a mirror and still serves the view', async () => {
   let calls = 0
+  /** The registry the host was told these versions came from. */
+  let served
   const { routes } = harness({
     deps: {
       fetchImpl: async () => {
@@ -158,6 +166,7 @@ test('a network-layer registry failure falls back to a mirror and still serves t
           json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {}, '0.4.0': {} } }),
         }
       },
+      served: registry => { served = registry },
     },
   })
   const res = await invoke(routes, VERSION_API.check)
@@ -165,6 +174,11 @@ test('a network-layer registry failure falls back to a mirror and still serves t
   assert.equal(calls, 2, 'the primary registry and one mirror were both tried')
   assert.equal(res.body.result.publishedError, undefined)
   assert.equal(res.body.result.channels[0].version, '0.5.0')
+  // The install that follows this view asks npm for THIS url, not the configured
+  // one: the configured registry is the one that just proved unreachable, and
+  // re-asking it for 0.5.0 would report the offered update as nonexistent.
+  assert.match(String(served), /^https?:\/\//, 'the fallback source is reported to the host')
+  assert.notEqual(served, DEFAULT_REGISTRY, 'a mirror is not reported as the registry it replaced')
 })
 
 test('a registry that answers with an HTTP error does not fall back', async () => {

@@ -104,6 +104,56 @@ test('start spawns node npm-cli.js without a shell and settles on exit 0', async
   assert.deepEqual(settled, [{ version: '0.5.0', ok: true, trigger: 'scheduled' }])
 })
 
+test('an install asks the registry that served the versions, not the configured one', async (t) => {
+  const spawn = spawnStub()
+  /**
+   * Settle the install that was just spawned — the process-wide slot is held
+   * until its child closes, and a test that leaves one running locks every
+   * later test in this file out.
+   * @returns {Promise<string[]>} the npm arguments it was spawned with.
+   */
+  const finish = async () => {
+    const call = spawn.calls.at(-1)
+    assert.ok(call !== undefined, 'an install was spawned')
+    call.child.exitCode = 0
+    call.child.emit('close', 0)
+    await Promise.resolve()
+    return call.args
+  }
+  // The configured registry is the wrong source precisely when it matters: a
+  // mirror answers only because that URL was unreachable, and re-asking it for
+  // the version on screen reports the offered update as nonexistent. The value
+  // is read at spawn time, so a check that succeeded since moves it.
+  const viaMirror = createUpdater({
+    spawnImpl: spawn,
+    npmCli: '/npm/cli.js',
+    lockPath: FILE_LOCK,
+    registry: 'https://registry.internal',
+    servedRegistry: () => 'https://registry.npmmirror.test',
+  })
+  t.after(() => viaMirror.dispose())
+  viaMirror.start('0.5.0', 'manual')
+  assert.deepEqual((await finish()).slice(-2), ['--registry', 'https://registry.npmmirror.test'])
+
+  // Before any read has answered, the configured value still decides...
+  const notYet = createUpdater({
+    spawnImpl: spawn,
+    npmCli: '/npm/cli.js',
+    lockPath: FILE_LOCK,
+    registry: 'https://registry.internal',
+    servedRegistry: () => undefined,
+  })
+  t.after(() => notYet.dispose())
+  notYet.start('0.6.0', 'manual')
+  assert.deepEqual((await finish()).slice(-2), ['--registry', 'https://registry.internal'])
+
+  // ...and with neither, npm keeps its own default.
+  const bare = createUpdater({ spawnImpl: spawn, npmCli: '/npm/cli.js', lockPath: FILE_LOCK })
+  t.after(() => bare.dispose())
+  bare.start('0.7.0', 'manual')
+  assert.ok(!(await finish()).join(' ').includes('--registry'), 'no registry flag was invented')
+})
+
 test('non-zero exits settle as failed with the code in view and history', async (t) => {
   const settled = []
   const spawn = spawnStub()
