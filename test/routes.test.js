@@ -88,7 +88,7 @@ test('the full route family registers; optional routes appear only when wired', 
       notes: async () => ({}),
       repoSlug: 'o/r',
       policy: { get: () => DEFAULT_POLICY, set: () => {} },
-      snapshots: { list: () => [], restore: () => ({ ok: true }) },
+      snapshots: { list: () => [], restore: () => ({ ok: true }), remove: () => ({ ok: true }) },
     },
   })
   for (const path of Object.values(VERSION_API)) {
@@ -394,12 +394,69 @@ test('snapshot center lists and restores through its operations', async () => {
 test('restore refuses while an install is writing the tree', async () => {
   const { routes } = harness({
     deps: {
-      snapshots: { list: () => [], restore: () => ({ ok: true }) },
+      snapshots: { list: () => [], restore: () => ({ ok: true }), remove: () => ({ ok: true }) },
     },
     taskView: () => ({ state: 'running', log: '' }),
   })
   const res = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
   assert.equal(res.status, 409)
+})
+
+test('a snapshot delete reaches its operation once and returns the surviving list', async () => {
+  /** Every version the route asked the composition to discard. */
+  const removed = []
+  const { routes } = harness({
+    deps: {
+      snapshots: {
+        list: () => [{ version: '0.3.0', at: 3 }],
+        restore: () => ({ ok: true }),
+        remove: version => {
+          removed.push(version)
+          return version === '0.4.0' ? { ok: true } : { ok: false, error: `no snapshot of ${version} to delete` }
+        },
+      },
+    },
+  })
+  const res = await invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 200)
+  assert.deepEqual(removed, ['0.4.0'])
+  assert.equal(res.body.result.removed, '0.4.0')
+  // The surviving list rides along: the row the user just deleted has to leave
+  // the panel, and a second round-trip against a busy host is how a stale row
+  // survives next to one that is already gone.
+  assert.deepEqual(res.body.result.snapshots, [{ version: '0.3.0', at: 3 }])
+
+  // A version that is not one exact published version never reaches a filesystem
+  // path at all — same gate the restore route holds.
+  const bad = await invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '../outside' } })
+  assert.equal(bad.status, 400)
+  assert.deepEqual(removed, ['0.4.0'], 'the rejected version was never handed to the operation')
+
+  // Nothing to delete is a conflict, not a success: the panel must not drop a row
+  // it was told to remove and could not.
+  const missing = await invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.9.9' } })
+  assert.equal(missing.status, 409)
+  assert.match(String(missing.body.error), /no snapshot of 0\.9\.9/)
+})
+
+test('a snapshot delete refuses while this host is installing', async () => {
+  let touched = 0
+  const { routes } = harness({
+    deps: {
+      snapshots: {
+        list: () => [],
+        restore: () => ({ ok: true }),
+        remove: () => { touched += 1; return { ok: true } },
+      },
+    },
+    // The snapshot a running install took moments ago is its own way out: the
+    // failure path looks for exactly that directory, so deleting it mid-install
+    // would leave a broken tree with nothing to restore.
+    taskView: () => ({ state: 'running', log: '' }),
+  })
+  const res = await invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 409)
+  assert.equal(touched, 0, 'the refusal happens before anything is unlinked')
 })
 
 test('an async restore is awaited, and a contended lock answers 409 not 500', async () => {

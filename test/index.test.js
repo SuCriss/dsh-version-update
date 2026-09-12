@@ -96,10 +96,11 @@ test('apply mounts the full core family; notes stay off without a repo slug', (t
     VERSION_API.restart,
     VERSION_API.restartCancel,
     VERSION_API.restore,
+    VERSION_API.snapshotDelete,
     VERSION_API.snapshots,
     VERSION_API.status,
     VERSION_API.update,
-  ].sort(), 'notes requires a GitHub repo; this fake manifest has none')
+  ].sort(), 'the family is exactly these routes; /notes stays absent without a repo slug')
   assert.equal(new Set(paths).size, paths.length, 'the web server keys routes by path: no family may mount one twice')
 })
 
@@ -260,6 +261,35 @@ test('a restore goes through the snapshot store and back to the recorded version
   const history = JSON.parse(readFileSync(join(dataDir, 'history.json'), 'utf8'))
   assert.equal(history.at(-1).restored, true)
   assert.equal(history.at(-1).to, '0.4.0')
+})
+
+test('a snapshot delete unlinks that version, leaves the tree alone, and writes no history', async (t) => {
+  const { installDir, dataDir } = environment(t)
+  const snapshotsDir = join(dataDir, 'snapshots')
+  assert.deepEqual(await createSnapshotAsync({ installDir, snapshotsDir, version: '0.4.0', now: () => 1000 }), { ok: true })
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
+  const res = await invoke(ctx.registered, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(existsSync(join(snapshotsDir, '0.4.0')), false, 'that snapshot is gone from disk')
+  assert.deepEqual(res.body.result.snapshots, [], 'and it is gone from the list the route returned')
+  // The live tree is not what this operation touches, so it must survive
+  // byte-for-byte: a deleted backup that also cost the installation is worse
+  // than no delete at all.
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.4.0')
+  // A discarded backup is not a transition of the installed version. The audit
+  // trail answers "what was this machine running, and when"; writing a record per
+  // deletion would read as a restore that never happened.
+  const historyPath = join(dataDir, 'history.json')
+  const entries = existsSync(historyPath) ? JSON.parse(readFileSync(historyPath, 'utf8')) : []
+  assert.deepEqual(entries, [])
+
+  // The same delete again is a conflict, not a silent success: the caller asked
+  // for something that is no longer there to remove.
+  const again = await invoke(ctx.registered, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(again.status, 409)
+  assert.match(String(again.body.error), /no snapshot of 0\.4\.0/)
 })
 
 test('a restore yields to another host that holds the machine-wide lock', async (t) => {

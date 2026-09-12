@@ -558,6 +558,49 @@ test('install settles into a cancellable countdown; restart reloads when ready',
   }
 })
 
+test('deleting a snapshot takes two clicks on the same row', async () => {
+  const client = await loadClient()
+  const overlay = fakeOverlay()
+  const fetch = fakeFetch({
+    // Insertion order matters to the stub: it matches by suffix, so the more
+    // specific route has to be listed before the shorter one it contains.
+    '/snapshots/delete': () => json({ result: { removed: '0.3.0', snapshots: [{ version: '0.2.0', at: 2 }] } }),
+    '/snapshots': () => json({ result: { snapshots: [{ version: '0.3.0', at: 1 }, { version: '0.2.0', at: 2 }] } }),
+    '/policy': () => json({ result: { policy: DEFAULT_POLICY } }),
+    '/check': () => json({ result: { installed: '0.4.0', channels: [], versions: [] } }),
+  })
+  fetch.install()
+  const controller = client.createController({ t, overlay })
+  await controller.check()
+  assert.deepEqual(controller.getSnapshot().snapshots.map(entry => entry.version), ['0.3.0', '0.2.0'])
+
+  // The first click arms the row and asks the host for nothing: this is the one
+  // path in the panel that permanently destroys data with no undo.
+  await controller.deleteSnapshot('0.3.0')
+  assert.equal(controller.getSnapshot().deleteArmed, '0.3.0')
+  assert.equal(fetch.hit('POST', '/snapshots/delete'), 0, 'arming must not delete')
+
+  // The second click on the same version deletes, and the row leaves the panel
+  // with the list the host sent back rather than a guess of what survived.
+  await controller.deleteSnapshot('0.3.0')
+  assert.equal(fetch.hit('POST', '/snapshots/delete'), 1)
+  assert.equal(controller.getSnapshot().deleteArmed, undefined)
+  assert.deepEqual(controller.getSnapshot().snapshots.map(entry => entry.version), ['0.2.0'])
+
+  // A click on a DIFFERENT row moves the arm rather than firing the first one: a
+  // user who changes their mind mid-list deletes nothing.
+  await controller.deleteSnapshot('0.2.0')
+  assert.equal(controller.getSnapshot().deleteArmed, '0.2.0')
+  assert.equal(fetch.hit('POST', '/snapshots/delete'), 1)
+
+  // And a check drops the arm — the list a row was armed against may not be the
+  // list on screen any more.
+  await controller.check()
+  assert.equal(controller.getSnapshot().deleteArmed, undefined)
+  await controller.deleteSnapshot('0.2.0')
+  assert.equal(fetch.hit('POST', '/snapshots/delete'), 1, 'the stale arm did not fire on its own')
+})
+
 test('a dropped poll keeps following the install instead of ending it', async (ctx) => {
   const client = await loadClient()
   ctx.mock.timers.enable()
