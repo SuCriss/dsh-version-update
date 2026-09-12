@@ -601,6 +601,48 @@ test('deleting a snapshot takes two clicks on the same row', async () => {
   assert.equal(fetch.hit('POST', '/snapshots/delete'), 1, 'the stale arm did not fire on its own')
 })
 
+test('tree health reaches the panel on the poll it changes in', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    // What a host reports once an interrupted npm has left the global tree
+    // half-committed: no readable manifest, retired directories still in place.
+    const broken = {
+      installDir: '/prefix/node_modules/@deepseek-ai/dsh',
+      manifestOk: false,
+      leftovers: [{ name: '@deepseek-ai.dsh-abc123', path: '/x', ageMs: 9000 }],
+      healthy: false,
+      removed: 0,
+      at: 5,
+    }
+    let phase = 'running'
+    fakeFetch({
+      '/update': () => json({ result: { state: 'running', version: '9.9.9', log: '' } }),
+      '/status': () => json({ result: phase === 'running'
+        ? { state: 'running', version: '9.9.9', log: 'npm ERR!' }
+        : { state: 'failed', version: '9.9.9', log: '', error: 'npm exited 1', tree: broken } }),
+    }).install()
+    const controller = client.createController({ t, overlay })
+    await controller.startUpdate('9.9.9')
+    assert.equal(controller.getSnapshot().tree, undefined, 'no answer has carried a verdict yet')
+
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.equal(controller.getSnapshot().tree, undefined, 'a running install has nothing to report')
+
+    // The repair that produces this fact runs after a failed install settles, so
+    // the verdict arrives on a status answer — not on the panel's own check, which
+    // may be many minutes stale by then.
+    phase = 'failed'
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.deepEqual(controller.getSnapshot().tree, broken, 'the failure carried its tree health through')
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
 test('a dropped poll keeps following the install instead of ending it', async (ctx) => {
   const client = await loadClient()
   ctx.mock.timers.enable()
