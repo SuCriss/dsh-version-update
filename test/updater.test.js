@@ -6,14 +6,26 @@
  */
 
 import assert from 'node:assert/strict'
-import { test } from 'node:test'
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { after, test } from 'node:test'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { createUpdater, resolveNpmCli } from '../lib/updater.js'
 import { readLockHolder } from '../lib/updatelock.js'
+
+/**
+ * The lock file every runner in this file contends on. The suite must never
+ * acquire — or be refused by — the machine-wide lock real hosts share: a second
+ * test file's process, or a dsh host somebody left running on the machine,
+ * would make these assertions fail for reasons that have nothing to do with the
+ * code under test. Two tests below name a file of their own because they
+ * inspect the lock itself rather than merely contend for it.
+ */
+const lockHome = mkdtempSync(join(tmpdir(), 'vu-updater-'))
+const FILE_LOCK = join(lockHome, 'update.lock')
+after(() => rmSync(lockHome, { recursive: true, force: true }))
 
 /**
  * A fake spawned child: enough of ChildProcess for the runner's listeners.
@@ -66,6 +78,7 @@ test('start spawns node npm-cli.js without a shell and settles on exit 0', async
   const updater = createUpdater({
     spawnImpl: spawn,
     npmCli: '/npm/cli.js',
+    lockPath: FILE_LOCK,
     onSettled: info => settled.push(info),
   })
   t.after(() => updater.dispose())
@@ -94,7 +107,7 @@ test('start spawns node npm-cli.js without a shell and settles on exit 0', async
 test('non-zero exits settle as failed with the code in view and history', async (t) => {
   const settled = []
   const spawn = spawnStub()
-  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', onSettled: info => settled.push(info) })
+  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', lockPath: FILE_LOCK, onSettled: info => settled.push(info) })
   t.after(() => updater.dispose())
   updater.start('1.0.0')
   const call = spawn.calls[0]
@@ -108,12 +121,12 @@ test('non-zero exits settle as failed with the code in view and history', async 
 
 test('the slot is exclusive across runner instances until the orphan settles', async () => {
   const spawnA = spawnStub()
-  const first = createUpdater({ spawnImpl: spawnA, npmCli: '/n' })
+  const first = createUpdater({ spawnImpl: spawnA, npmCli: '/n', lockPath: FILE_LOCK })
   first.start('1.0.0')
 
   // A fresh instance (as after a fiber reload) still sees the orphaned npm.
   const spawnB = spawnStub()
-  const second = createUpdater({ spawnImpl: spawnB, npmCli: '/n' })
+  const second = createUpdater({ spawnImpl: spawnB, npmCli: '/n', lockPath: FILE_LOCK })
   assert.throws(() => second.start('1.1.0'), /already running in this host/)
   assert.equal(spawnB.calls.length, 0)
 
@@ -133,7 +146,7 @@ test('the slot is exclusive across runner instances until the orphan settles', a
 
 test('dispose leaves a running install alive and its slot claimed', async (t) => {
   const spawn = spawnStub()
-  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n' })
+  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', lockPath: FILE_LOCK })
   updater.start('1.2.3')
   const child = spawn.calls[0].child
   // Whatever this asserts, the shared process-wide slot must be released
@@ -145,7 +158,7 @@ test('dispose leaves a running install alive and its slot claimed', async (t) =>
     }
   })
   assert.equal(child.killed, false, 'disposal must not kill npm')
-  const replacement = createUpdater({ spawnImpl: spawnStub(), npmCli: '/n' })
+  const replacement = createUpdater({ spawnImpl: spawnStub(), npmCli: '/n', lockPath: FILE_LOCK })
   assert.throws(() => replacement.start('1.3.0'), /already running in this host/)
 })
 
@@ -156,6 +169,7 @@ test('beforeSpawn gates npm, streams progress, and its failure degrades to a log
   const updater = createUpdater({
     spawnImpl: spawn,
     npmCli: '/n',
+    lockPath: FILE_LOCK,
     beforeSpawn: async (version, report) => {
       report('snapshot: 50% copied\n')
       snapshotted.push(version)
@@ -182,6 +196,7 @@ test('beforeSpawn gates npm, streams progress, and its failure degrades to a log
   const failing = createUpdater({
     spawnImpl: failingSpawn,
     npmCli: '/n',
+    lockPath: FILE_LOCK,
     beforeSpawn: () => { throw new Error('disk full') },
   })
   t.after(() => failing.dispose())
@@ -203,6 +218,7 @@ test('start answers while the snapshot runs and the preparation window holds the
   const updater = createUpdater({
     spawnImpl: spawn,
     npmCli: '/n',
+    lockPath: FILE_LOCK,
     beforeSpawn: () => gate,
   })
   t.after(async () => {
@@ -233,7 +249,7 @@ test('start answers while the snapshot runs and the preparation window holds the
 })
 test('an unknown trigger or malformed version refuses without spawning', (t) => {
   const spawn = spawnStub()
-  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n' })
+  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', lockPath: FILE_LOCK })
   t.after(() => updater.dispose())
   assert.throws(() => updater.start('0.1.0', 'telepathy'), /unknown trigger/)
   assert.throws(() => updater.start('^1.0.0'), /not one exact published version/)
@@ -243,7 +259,7 @@ test('an unknown trigger or malformed version refuses without spawning', (t) => 
 
 test('the soft deadline notes the slow run but never kills npm', async (t) => {
   const spawn = spawnStub()
-  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', timeoutMs: 30, hardTimeoutMs: 10_000 })
+  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', lockPath: FILE_LOCK, timeoutMs: 30, hardTimeoutMs: 10_000 })
   t.after(() => updater.dispose())
   updater.start('5.0.0')
   await new Promise(resolve => setTimeout(resolve, 80))
@@ -259,7 +275,7 @@ test('the soft deadline notes the slow run but never kills npm', async (t) => {
 
 test('a wedged install is killed only at the hard ceiling and reported failed', async (t) => {
   const spawn = spawnStub()
-  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', timeoutMs: 30, hardTimeoutMs: 60 })
+  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', lockPath: FILE_LOCK, timeoutMs: 30, hardTimeoutMs: 60 })
   t.after(() => updater.dispose())
   updater.start('5.0.0')
   await new Promise(resolve => setTimeout(resolve, 120))
@@ -269,14 +285,14 @@ test('a wedged install is killed only at the hard ceiling and reported failed', 
   // The kill only delivered a signal: the slot stays claimed until the child
   // has really exited, because the repair and the next install would otherwise
   // race a zombie npm over the same global tree.
-  assert.throws(() => createUpdater({ spawnImpl: spawnStub(), npmCli: '/n' }).start('5.0.1'), /already running in this host process/)
+  assert.throws(() => createUpdater({ spawnImpl: spawnStub(), npmCli: '/n', lockPath: FILE_LOCK }).start('5.0.1'), /already running in this host process/)
   const killed = spawn.calls[0].child
   killed.signalCode = 'SIGTERM'
   killed.emit('exit', null, 'SIGTERM')
   await new Promise(resolve => setTimeout(resolve, 10))
   // Now a replacement runner may start.
   const spawnNext = spawnStub()
-  const next = createUpdater({ spawnImpl: spawnNext, npmCli: '/n' })
+  const next = createUpdater({ spawnImpl: spawnNext, npmCli: '/n', lockPath: FILE_LOCK })
   t.after(() => next.dispose())
   assert.equal(next.start('5.0.1').state, 'running')
   spawnNext.calls[0].child.exitCode = 0
@@ -355,7 +371,7 @@ test('an orphaned run settling late cannot unlock the newer run', async (t) => {
 test('the retained log tail respects LOG_LIMIT', async (t) => {
   const { LOG_LIMIT } = await import('../lib/updater.js')
   const spawn = spawnStub()
-  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n' })
+  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n', lockPath: FILE_LOCK })
   t.after(() => updater.dispose())
   updater.start('7.7.7')
   const child = spawn.calls[0].child

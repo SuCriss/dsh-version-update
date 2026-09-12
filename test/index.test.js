@@ -154,7 +154,7 @@ test('status reports the running version from the discovered installation', asyn
 test('snapshots start empty and restore reports a missing snapshot as conflict', async (t) => {
   const { dataDir } = environment(t)
   const ctx = fakeCtx()
-  apply(ctx, { dataDir })
+  apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
 
   const listed = await invoke(ctx.registered, VERSION_API.snapshots)
   assert.deepEqual(listed.body.result.snapshots, [])
@@ -164,6 +164,9 @@ test('snapshots start empty and restore reports a missing snapshot as conflict',
     body: { version: '9.9.9' },
   })
   assert.equal(failed.status, 409)
+  // The reason matters: a 409 from lock contention would pass the status check
+  // while proving nothing about the snapshot store.
+  assert.match(failed.body.error, /no usable snapshot of 9\.9\.9/)
 })
 
 test('a panel check feeds the scheduler, so the auto decision runs without any daily timer', async (t) => {
