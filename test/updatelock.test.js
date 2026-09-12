@@ -77,6 +77,48 @@ test('own pid in the lock is stolen (a crashed self-heal)', () => {
   result.release()
 })
 
+test('a stolen lock survives the release of the holder it was stolen from', () => {
+  const path = lockPath()
+  const first = acquireUpdateLock({ lockPath: path, pid: 42 })
+  assert.equal(first.ok, true)
+  // The exact updater scenario: a fiber reload leaves the previous run's lock
+  // in place, the replacement steals it (own pid), and the orphan then settles.
+  const second = acquireUpdateLock({ lockPath: path, pid: 42 })
+  assert.equal(second.ok, true, 'a same-pid self-heal steal must succeed')
+  first.release()
+  assert.ok(readLockHolder(readFileSync(path, 'utf8')), 'the orphan release left the live lock alone')
+  // A foreign takeover is refused the same way.
+  writeFileSync(path, JSON.stringify({ pid: 43, at: Date.now(), token: 'foreign' }), 'utf8')
+  second.release()
+  assert.equal(readLockHolder(readFileSync(path, 'utf8'))?.pid, 43, 'never removes another host\'s lock')
+})
+
+test('each acquisition writes a record only its own release can remove', () => {
+  const path = lockPath()
+  const first = acquireUpdateLock({ lockPath: path, pid: 5, now: () => 1000 })
+  const record = readFileSync(path, 'utf8')
+  assert.ok(JSON.parse(record).token, 'the record carries an ownership token')
+  assert.deepEqual(readLockHolder(record), { pid: 5, at: 1000 }, 'the holder view stays the same shape')
+  first.release()
+  const second = acquireUpdateLock({ lockPath: path, pid: 5, now: () => 1000 })
+  assert.notEqual(readFileSync(path, 'utf8'), record, 'a repeated acquisition is a NEW record')
+  second.release()
+  assert.throws(() => readFileSync(path, 'utf8'), { code: 'ENOENT' })
+})
+
+test('a lock left unreadable is not "released" into someone else\'s file', () => {
+  const path = lockPath()
+  const holder = acquireUpdateLock({ lockPath: path, pid: 9 })
+  // Torn write: the file exists but names nothing.
+  writeFileSync(path, '{{{', 'utf8')
+  holder.release()
+  assert.equal(readFileSync(path, 'utf8'), '{{{', 'a release must not guess its way into deleting it')
+  // And an acquisition still treats it as stale rather than honoring it.
+  const next = acquireUpdateLock({ lockPath: path, pid: 10, isAlive: () => true })
+  assert.equal(next.ok, true)
+  next.release()
+})
+
 test('verifyInstalled accepts a matching tree and rejects mismatches', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vu-verify-'))
   try {

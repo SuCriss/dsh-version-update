@@ -7,8 +7,13 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { createUpdater, resolveNpmCli } from '../lib/updater.js'
+import { readLockHolder } from '../lib/updatelock.js'
 
 /**
  * A fake spawned child: enough of ChildProcess for the runner's listeners.
@@ -261,6 +266,90 @@ test('a wedged install is killed only at the hard ceiling and reported failed', 
   assert.equal(updater.view().state, 'failed')
   assert.equal(updater.view().error, 'install exceeded the hard time limit')
   assert.equal(spawn.calls[0].child.killed, true)
+  // The kill only delivered a signal: the slot stays claimed until the child
+  // has really exited, because the repair and the next install would otherwise
+  // race a zombie npm over the same global tree.
+  assert.throws(() => createUpdater({ spawnImpl: spawnStub(), npmCli: '/n' }).start('5.0.1'), /already running in this host process/)
+  const killed = spawn.calls[0].child
+  killed.signalCode = 'SIGTERM'
+  killed.emit('exit', null, 'SIGTERM')
+  await new Promise(resolve => setTimeout(resolve, 10))
+  // Now a replacement runner may start.
+  const spawnNext = spawnStub()
+  const next = createUpdater({ spawnImpl: spawnNext, npmCli: '/n' })
+  t.after(() => next.dispose())
+  assert.equal(next.start('5.0.1').state, 'running')
+  spawnNext.calls[0].child.exitCode = 0
+  spawnNext.calls[0].child.emit('close', 0)
+  await Promise.resolve()
+})
+
+test('a refused start never leaves the machine-wide lock behind', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'vu-lock-'))
+  const lockPath = join(dir, 'update.lock')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  // No npm CLI exists beside this fake node binary, so start() must refuse —
+  // and it must do so WITHOUT leaving the lock it would have needed behind.
+  // The refusal explicitly sends the user to a terminal; a leaked lock would
+  // then refuse that other host for the lock's whole staleness window.
+  const updater = createUpdater({
+    spawnImpl: spawnStub(),
+    execPath: '/nowhere/bin/node',
+    env: {},
+    lockPath,
+  })
+  t.after(() => updater.dispose())
+  assert.throws(() => updater.start('6.0.0'), /npm CLI not found/)
+  assert.equal(existsSync(lockPath), false, 'a refused start releases the lock')
+  assert.throws(() => updater.start('6.0.0', 'telepathy'), /unknown trigger/)
+  assert.equal(existsSync(lockPath), false, 'a validation refusal releases the lock too')
+
+  // The refusal must not strand the process-wide claim either: a later run in
+  // the same process still works.
+  const spawnNext = spawnStub()
+  const next = createUpdater({ spawnImpl: spawnNext, npmCli: '/n', lockPath })
+  t.after(() => next.dispose())
+  assert.equal(next.start('6.0.1').state, 'running')
+  spawnNext.calls[0].child.exitCode = 0
+  spawnNext.calls[0].child.emit('close', 0)
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(existsSync(lockPath), false, 'a settled run releases the lock')
+})
+
+test('an orphaned run settling late cannot unlock the newer run', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'vu-orphan-'))
+  const lockPath = join(dir, 'update.lock')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const spawnA = spawnStub()
+  const first = createUpdater({ spawnImpl: spawnA, npmCli: '/n', lockPath })
+  first.start('1.0.0')
+  const orphan = spawnA.calls[0].child
+  // A config reload disposes the fiber but deliberately leaves npm alive.
+  first.dispose()
+  // The orphan has exited — which is what releases the process-wide slot — but
+  // has not reported its close yet, so its settlement still lands LATER, after
+  // a newer run has claimed the slot and the lock.
+  orphan.exitCode = 0
+  const spawnB = spawnStub()
+  const second = createUpdater({ spawnImpl: spawnB, npmCli: '/n', lockPath })
+  t.after(() => second.dispose())
+  assert.equal(second.start('1.1.0').state, 'running')
+
+  orphan.emit('close', 0)
+  await new Promise(resolve => setTimeout(resolve, 10))
+
+  assert.equal(existsSync(lockPath), true, 'the live run keeps its lock after an orphan settles')
+  assert.equal(readLockHolder(readFileSync(lockPath, 'utf8'))?.pid, process.pid, 'still OUR lock')
+  // And the newer run's slot claim survived the orphan's settlement.
+  const spawnC = spawnStub()
+  const third = createUpdater({ spawnImpl: spawnC, npmCli: '/n', lockPath })
+  third.dispose()
+  assert.throws(() => third.start('1.2.0'), /already running in this host process/)
+
+  // Clean up: settle the live run so nothing leaks into later tests.
+  spawnB.calls[0].child.exitCode = 0
+  spawnB.calls[0].child.emit('close', 0)
+  await new Promise(resolve => setTimeout(resolve, 10))
 })
 
 test('the retained log tail respects LOG_LIMIT', async (t) => {
