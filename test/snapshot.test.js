@@ -1,7 +1,8 @@
 /**
  * Snapshot store tests: creation with metadata, idempotent reuse, damaged
  * snapshot replacement, retention pruning, listing, and restore over a live
- * installation.
+ * installation — including the async siblings the host serves through, whose
+ * progress contract and leftover-free swap must match the synchronous ones.
  */
 
 import assert from 'node:assert/strict'
@@ -9,7 +10,7 @@ import { test } from 'node:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { createSnapshot, defaultSnapshotsDir, listSnapshots, removeSnapshot, restoreSnapshot } from '../lib/snapshot.js'
+import { createSnapshot, createSnapshotAsync, defaultSnapshotsDir, listSnapshots, measureTree, removeSnapshot, restoreSnapshot, restoreSnapshotAsync } from '../lib/snapshot.js'
 
 /** Build one fake installed dsh tree of the given version. */
 function fakeInstall(t, version) {
@@ -111,4 +112,54 @@ test('restore refuses versions without a usable snapshot and rejects non-version
   assert.equal(restoreSnapshot({ installDir: install, snapshotsDir, version: '3.0.0' }).ok, false)
   assert.equal(restoreSnapshot({ installDir: install, snapshotsDir, version: '../etc' }).ok, false)
   assert.equal(removeSnapshot(snapshotsDir, '../etc'), false)
+})
+
+test('the async restore matches the synchronous one and leaves nothing beside', async (t) => {
+  const install = fakeInstall(t, '4.0.0')
+  const snapshotsDir = snapHome(t)
+  assert.deepEqual(await createSnapshotAsync({ installDir: install, snapshotsDir, version: '4.0.0', now: () => 7 }), { ok: true })
+  // Simulate an update having moved the live tree forward and lost the launcher.
+  writeFileSync(join(install, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '4.1.0' }))
+  rmSync(join(install, 'lib', 'bin.js'))
+  assert.deepEqual(await restoreSnapshotAsync({ installDir: install, snapshotsDir, version: '4.0.0' }), { ok: true })
+  assert.equal(JSON.parse(readFileSync(join(install, 'package.json'), 'utf8')).version, '4.0.0')
+  assert.ok(existsSync(join(install, 'lib', 'bin.js')), 'the launcher came back from the snapshot')
+  assert.deepEqual(readdirSync(dirname(install)).filter(name => name.includes('.replaced-')), [])
+  // The same refusals as the synchronous variant: nothing usable, nothing vague.
+  assert.equal((await restoreSnapshotAsync({ installDir: install, snapshotsDir, version: '4.2.0' })).ok, false)
+  assert.equal((await restoreSnapshotAsync({ installDir: install, snapshotsDir, version: '..\\windows' })).ok, false)
+})
+
+test('the async snapshot reports live counts against the measured totals', async (t) => {
+  const install = fakeInstall(t, '5.0.0')
+  const snapshotsDir = snapHome(t)
+  /** @type {{ phase: string; files: number; bytes: number; totalFiles?: number; totalBytes?: number }[]} */
+  const events = []
+  assert.deepEqual(await createSnapshotAsync({
+    installDir: install,
+    snapshotsDir,
+    version: '5.0.0',
+    now: () => 11,
+    progressMs: 1,
+    onProgress: info => events.push(info),
+  }), { ok: true })
+
+  const measure = events.filter(entry => entry.phase === 'measure')
+  const copies = events.filter(entry => entry.phase === 'copy')
+  assert.equal(measure.length, 1, 'exactly one measuring report, before the copy starts')
+  assert.ok(copies.length > 0, 'the copy phase reported at least once')
+  // The contract the panel's percentage is computed from. Spreading the totals
+  // object over the live counts used to satisfy neither: `bytes` arrived as the
+  // TOTAL (so every tick looked finished) and `totalBytes` never arrived at all.
+  const expected = await measureTree(install)
+  for (const entry of copies) {
+    assert.equal(typeof entry.files, 'number')
+    assert.equal(typeof entry.bytes, 'number')
+    assert.equal(entry.totalFiles, expected.files, 'the total file count rides along')
+    assert.equal(entry.totalBytes, expected.bytes, 'the total byte count rides along')
+    assert.ok(entry.bytes <= entry.totalBytes, 'a copy in progress cannot exceed its own total')
+    assert.ok(entry.files <= entry.totalFiles)
+  }
+  assert.equal(copies.at(-1).bytes, expected.bytes, 'the last report is the completed copy')
+  assert.equal(measure[0].totalBytes, expected.bytes)
 })
