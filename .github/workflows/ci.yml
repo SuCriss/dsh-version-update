@@ -28,9 +28,10 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      # No lockfile is committed (the only dependencies are dev tools), so a
-      # plain install is correct here.
-      - run: npm install
+      # The dev dependencies are pinned in a committed package-lock.json, so CI
+      # installs exactly what the lockfile resolves. `npm install` would let a
+      # floating peer range drift between a green run and a red one.
+      - run: npm ci
 
       - run: npm run typecheck
 
