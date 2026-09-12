@@ -3,6 +3,26 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.1.7] - 2026-09-12
+
+### Added
+
+- **The settings page now says what the host already knew about the installation
+  tree.** Since 1.1.0 the composition has measured the global tree it booted from,
+  repaired it when an interrupted npm left it half-committed, and carried the
+  result in every polling answer — and the browser half ignored it, so a machine
+  whose dsh manifest had vanished while the process kept serving from memory
+  displayed a panel that looked perfectly healthy. A card appears when the tree is
+  unhealthy or was rebuilt at startup, naming the directory it could not read, how
+  many retired folders still occupy disk, and what the repair could not finish. It
+  stays absent otherwise: a card that reports nothing every time is a card the user
+  learns to skip.
+- That verdict is carried through the install poll as well as the panel's own
+  check, because the repair that produces it runs when an install **fails** — the
+  one moment the poll is watching and a stale check cannot cover. A status answer
+  without the field keeps the last verdict rather than erasing it: absence means
+  this host never located a tree, not that the previous one healed.
+
 ## [1.1.6] - 2026-09-12
 
 ### Added

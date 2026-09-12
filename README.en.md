@@ -62,7 +62,7 @@ Three halves in one package:
   - `GET /notes?version=` — GitHub release notes (mounted when enabled and a repo is known)
   - `GET|POST /policy` — read / patch the policy; every rejected field is named in a 400
   - `GET /snapshots`, `POST /restore`, `POST /snapshots/delete` — list, restore, and discard one snapshot; a restore contends for the same machine-wide lock an install holds, so a busy tree in this host or another answers 409. Deleting takes that lock too without ever writing the tree (a failed install looks for exactly that directory), answers with the surviving list, and arms on the first click in the panel to delete on the second.
-- **Browser half** (`lib/client.js`, exports `./client`): dictionaries, the settings page (status / policy form / versions / task log / snapshots / history), nav glyph marker, restart watchdog.
+- **Browser half** (`lib/client.js`, exports `./client`): dictionaries, the settings page (status / policy form / versions / task log / snapshots / history / installation-tree health), nav glyph marker, restart watchdog.
 - **Detached relaunch helper** (`lib/relaunch.js`): waits for pid exit + port release, starts the replacement verbatim; optionally stays alive to snapshot-recover an unreachable replacement.
 
 ## Install
@@ -93,7 +93,7 @@ Runtime behavior (mode, tracking, window, schedule) lives in the policy file edi
 ## Development
 
 ```sh
-npm test          # node:test — 149 cases across protocol/domain/routes/composition/browser controller/relaunch helper
+npm test          # node:test — 150 cases across protocol/domain/routes/composition/browser controller/relaunch helper
 npm run typecheck # tsc --checkJs strict — type safety without a build step
 ```
 
