@@ -81,7 +81,7 @@ dsh plugin --profile web add github:SuCriss/dsh-version-update
 
 ## 配置（cordis entry config）
 
-- `registry`（默认 `https://registry.npmjs.org`）— 读取与安装共用的 registry 基地址，必须是绝对 http(s) URL。
+- `registry`（默认 `https://registry.npmjs.org`）— 读取与安装共用的 registry 基地址，必须是绝对 http(s) URL。若该地址在网络层失败，读取会落到内置镜像并记住它：随后的安装按**实际读到版本的那个** registry 执行，不会回去问刚刚超时的地址。
 - `allowRestart`（默认 true）— 关闭则不提供重启路由。
 - `releaseNotes`（默认 true）— 是否读取并展示 GitHub 发布说明。
 - `snapshotKeep`（默认 5，1–10）— 快照保留数量。
@@ -93,7 +93,7 @@ dsh plugin --profile web add github:SuCriss/dsh-version-update
 ## 开发
 
 ```sh
-npm test          # node:test，143 个用例覆盖协议/域逻辑/路由/组装/浏览器控制器/重启助手
+npm test          # node:test，145 个用例覆盖协议/域逻辑/路由/组装/浏览器控制器/重启助手
 npm run typecheck # tsc --checkJs strict，无构建产物的类型安全
 ```
 

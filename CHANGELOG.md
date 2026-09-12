@@ -3,6 +3,36 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.1.5] - 2026-09-12
+
+### Fixed
+
+- **An update could be refused by the registry that had just served it.**
+  `fetchPublished` tries the configured registry and, when that URL fails at the
+  network layer, falls through to a mirror — and reports which one answered. Both
+  readers threw that fact away, so the install passed npm the *configured* URL:
+  on a machine whose registry is unreachable but mirrored, the panel offered a
+  version it had read from the mirror and npm was then asked for it at the address
+  that had just timed out, reporting the update as nonexistent. The answering
+  registry is now remembered by the host (from both read sites) and read at spawn
+  time, so the install goes where the versions came from. Only a registry the host
+  itself read can ever be stored, so no request input can steer an npm argument.
+- **Any unrelated repaint discarded a half-typed policy form.** The panel built
+  the policy prop as a fresh object per render — the derived "next check" hint
+  travelled inside it — while the form's reset effect keys on that object's
+  identity. A poll landing, a notice timer, or another card's interaction therefore
+  replaced whatever the user was mid-way through editing, with nothing changed on
+  the host to justify it. The hint is its own prop now and the policy prop is the
+  controller's own state object, which changes identity precisely when the host
+  answers with a different policy: the one case the effect was meant to see.
+
+### Tests
+
+The suite reaches 145 cases, including a hooks-accurate React stand-in that drives
+`PolicyCard` render by render — the draft's survival lives in the interaction
+between a state slot and an effect dependency list, and is invisible from the
+controller.
+
 ## [1.1.4] - 2026-09-12
 
 ### Fixed

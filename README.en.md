@@ -81,7 +81,7 @@ Restart `dsh web` once so the host half mounts; until then the panel says so exp
 
 ## Configuration (cordis entry config)
 
-- `registry` (default `https://registry.npmjs.org`) — absolute http(s) URL used for BOTH reads and installs.
+- `registry` (default `https://registry.npmjs.org`) — absolute http(s) URL used for BOTH reads and installs. When that URL fails at the network layer the read falls through to a built-in mirror and the host remembers it: the install then goes to the registry the versions were actually read from, not back to the address that just timed out.
 - `allowRestart` (default true) — false removes the restart route.
 - `releaseNotes` (default true).
 - `snapshotKeep` (default 5, clamped 1–10).
@@ -93,7 +93,7 @@ Runtime behavior (mode, tracking, window, schedule) lives in the policy file edi
 ## Development
 
 ```sh
-npm test          # node:test — 143 cases across protocol/domain/routes/composition/browser controller/relaunch helper
+npm test          # node:test — 145 cases across protocol/domain/routes/composition/browser controller/relaunch helper
 npm run typecheck # tsc --checkJs strict — type safety without a build step
 ```
 
