@@ -69,21 +69,35 @@ function fakeOverlay() {
 
 /**
  * Install a fetch stub answering per path suffix.
- * @param {Record<string, (call: number) => object>} table - suffix → response factory.
+ *
+ * Method matters to this stub's callers: several routes are POST-only, so a
+ * handler that calls them without a body gets a 405 the browser half would
+ * never notice. Every call is therefore recorded with its method (and the
+ * parsed body) on `calls`, which is what the restart-deferral tests assert on.
+ * @param {Record<string, (call: number, meta: { method: string }) => object>} table - suffix → response factory.
  */
 function fakeFetch(table) {
   const counts = {}
+  /** @type {{ path: string; method: string; body: unknown }[]} */
+  const calls = []
   let phase = table
-  const impl = async (path) => {
+  const impl = async (path, init) => {
+    const method = typeof init?.method === 'string' ? init.method : 'GET'
+    calls.push({ path, method, body: init?.body })
     const key = Object.keys(phase).find(suffix => path.endsWith(suffix))
     if (key === undefined) throw new Error(`unexpected fetch: ${path}`)
     counts[key] = (counts[key] ?? 0) + 1
-    return phase[key](counts[key])
+    return phase[key](counts[key], { method })
   }
   return {
     /** Swap the answer table mid-test (e.g. once the host "restarted"). */
     setTable(next) { phase = next },
     counts,
+    calls,
+    /** How many times one method was used against one path suffix. */
+    hit(method, suffix) {
+      return calls.filter(call => call.method === method && call.path.endsWith(suffix)).length
+    },
     install() {
       globalThis.fetch = impl
       return impl
@@ -171,6 +185,31 @@ test('the browser version ranking mirrors the host grammar', async () => {
   assert.equal(client.isDowngrade('0.5.0', '0.4.0'), false)
   // Uncomparable values are never a downgrade.
   assert.equal(client.isDowngrade('latest', '0.4.0'), false)
+})
+
+test('the verdict never claims "up to date" for a registry it could not read', async () => {
+  const client = await loadClient()
+  const verdict = client.installVerdict
+  // The healthy cases.
+  assert.equal(verdict(t, { status: 'ready', installed: '0.4.0', channels: [] }, []), t('upToDate'))
+  assert.equal(
+    verdict(t, { status: 'ready', installed: '0.4.0' }, [{ version: '0.5.0' }]),
+    t('available', { version: '0.5.0' }),
+  )
+  // The one that used to lie: a degraded check answers with NO channels at all
+  // plus a publishedError, and an empty `ahead` proved nothing about what is
+  // published — the panel stated the single thing the data could not support.
+  assert.equal(
+    verdict(t, { status: 'ready', installed: '0.4.0', publishedError: 'fetch failed' }, []),
+    t('publishUnknown'),
+  )
+  // Nothing to say before the first read answers, or without a known version.
+  assert.equal(verdict(t, { status: 'loading' }, []), undefined)
+  assert.equal(verdict(t, { status: 'ready' }, []), undefined)
+  // Both dictionaries must carry the key the branch renders.
+  for (const lang of ['zh', 'en']) {
+    assert.ok(client.dictionaries[lang].publishUnknown, `${lang} names the unknown verdict`)
+  }
 })
 
 test('check merges local facts, registry view, and snapshots', async () => {
@@ -271,14 +310,16 @@ test('a rejected policy patch surfaces the host reason', async () => {
 test('a stale host discovered at page load offers a restart without arming one', async () => {
   const client = await loadClient()
   const overlay = fakeOverlay()
-  fakeFetch({
+  const fetch = fakeFetch({
     '/status': () => json({ result: {
       state: 'idle', log: '',
       running: '0.4.0', installed: '0.9.0', stale: true, needsRestart: true,
       restartable: true,
     } }),
     '/policy': () => json({ result: { policy: {} } }),
-  }).install()
+    '/cancel': () => json({ result: { cancelled: true } }),
+  })
+  fetch.install()
   const controller = client.createController({ t, overlay })
   controller.resume()
   await flush()
@@ -287,9 +328,14 @@ test('a stale host discovered at page load offers a restart without arming one',
   const view = overlay.last()
   assert.equal(view.title, t('restart.title'))
   assert.ok(view.actions.some(a => a.label === t('restart.now')))
-  // Offered, not forced: "later" leaves the page alone.
+  // Offered, not forced: "later" leaves the page alone — but the word carries
+  // the same promise in both dialogs, so it must also disarm a pending
+  // host-side fallback restart, through the POST-only cancel route.
   overlay.click(t('restart.later'))
+  await flush()
   assert.equal(overlay.hidden, 1)
+  assert.equal(fetch.hit('POST', '/restart/cancel'), 1, 'deferring the offer disarms the fallback')
+  assert.equal(fetch.hit('POST', '/restart'), 0, 'deferring must not restart anything')
 })
 
 test('the watchdog survives a reload through sessionStorage and reloads when ready', async (ctx) => {
@@ -327,7 +373,7 @@ test('install settles into a cancellable countdown; restart reloads when ready',
     let reloaded = 0
     let installPhase = 'running'
     let replacementReady = false
-    fakeFetch({
+    const fetch = fakeFetch({
       '/update': () => json({ result: { state: 'running', version: '9.9.9', log: '' } }),
       '/status': () => json({ result: replacementReady
         ? { state: 'idle', log: '', stale: false, needsRestart: false }
@@ -340,7 +386,8 @@ test('install settles into a cancellable countdown; restart reloads when ready',
           } }),
       '/restart': () => json({ result: {} }),
       '/cancel': () => json({ result: { cancelled: true } }),
-    }).install()
+    })
+    fetch.install()
     const controller = client.createController({ t, overlay, reload: () => { reloaded += 1 } })
 
     controller.requestUpdate('9.9.9')
@@ -361,8 +408,12 @@ test('install settles into a cancellable countdown; restart reloads when ready',
     assert.ok(overlay.shown.length > 0, 'the countdown overlay appeared')
     assert.ok(overlay.last().actions.some(a => a.label === t('restart.later')))
 
-    // "Later" cancels without restarting anything.
+    // "Later" cancels without restarting anything — and disarms the host-side
+    // fallback, which only happens if the cancel reaches the POST-only route.
     overlay.click(t('restart.later'))
+    await flush()
+    assert.equal(fetch.hit('POST', '/restart/cancel'), 1, 'deferring must POST the cancel route')
+    assert.equal(fetch.hit('GET', '/restart/cancel'), 0, 'a GET would answer 405 and be swallowed')
     assert.equal(controller.getSnapshot().restarting, false)
 
     // The manual path walks the identical watchdog flow to a reload.
