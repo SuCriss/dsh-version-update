@@ -61,7 +61,7 @@ DeepSeek Harness Web GUI 的「版本更新」设置菜单 —— v1.0 全面重
   - `POST /restart/cancel` — 取消已挂起的重启（面板点「稍后」时调用；只接受 POST，GET 返回 405）
   - `GET /notes?version=` — GitHub 发布说明（`releaseNotes` 开启且能解析出仓库时挂载）
   - `GET|POST /policy` — 读取 / 打补丁式修改策略（校验失败的每个字段都会被点名，400 返回）
-  - `GET /snapshots`、`POST /restore` — 快照列表与恢复；恢复与安装争用同一把机器锁，本机有安装在跑或其他宿主持锁都返回 409
+  - `GET /snapshots`、`POST /restore`、`POST /snapshots/delete` — 快照列表 / 恢复 / 删除单个快照（删除同样走机器锁但不碰安装树，成功时把剩余列表一并带回；面板里同一行点两次才删）；恢复与安装争用同一把机器锁，本机有安装在跑或其他宿主持锁都返回 409
 - **浏览器半区**（`lib/client.js`，exports `./client`）：字典、设置页（状态卡 / 策略表单 / 版本列表 / 任务日志 / 快照中心 / 活动历史）、导航图标标记、重启 watchdog。
 - **脱离父进程的重启助手**（`lib/relaunch.js`）：等旧 pid 消失、端口释放后原样拉起新进程；armed recovery 时驻留观察新进程可达性，必要时快照恢复再拉起。
 
@@ -93,7 +93,7 @@ dsh plugin --profile web add github:SuCriss/dsh-version-update
 ## 开发
 
 ```sh
-npm test          # node:test，145 个用例覆盖协议/域逻辑/路由/组装/浏览器控制器/重启助手
+npm test          # node:test，149 个用例覆盖协议/域逻辑/路由/组装/浏览器控制器/重启助手
 npm run typecheck # tsc --checkJs strict，无构建产物的类型安全
 ```
 

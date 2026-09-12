@@ -3,6 +3,38 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.1.6] - 2026-09-12
+
+### Added
+
+- **A snapshot can be deleted.** `POST /snapshots/delete` (body `{ version }`),
+  with a row action in the snapshot center. The snapshot store has had
+  `removeSnapshot` since it was written and nothing could reach it, so clearing a
+  backup meant opening the data directory in a file manager and guessing which
+  directory matched which version. Unusable snapshots — the ones marked incomplete
+  after an interrupted copy, restorable by nothing — had no action at all, which is
+  precisely the class of entry worth discarding by hand.
+  - Gated like restore: one exact published version or 400, and 409 while this host
+    is installing, because the snapshot a running install took moments ago is its
+    own way out and the failure path looks for exactly that directory.
+  - Takes the machine-wide lock even though it never writes the live tree, so it
+    cannot cross a restore of the same version mid-copy.
+  - Not an audit-trail event: history records which version this machine ran, and
+    discarding a backup changes none. Recording it would read as a restore.
+  - The success response carries the surviving list, so the deleted row leaves the
+    panel with the answer rather than a guess.
+  - Two clicks on the same row, because there is no undo. Any check drops the arm,
+    so a row armed against a list that has since moved cannot fire at a version the
+    user no longer sees.
+
+### Changed
+
+- `npm test` no longer names `test/protocol.test.js`. That file has never existed
+  here — git holds no record of it, not even a deletion — and `node --test` folds a
+  missing path into a list of fourteen real ones without complaint, while naming it
+  alone answers `Could not find`. The protocol layer is covered from policy, routes,
+  and index, so the phantom was removed rather than a file invented to fit the name.
+
 ## [1.1.5] - 2026-09-12
 
 ### Fixed
