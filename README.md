@@ -93,7 +93,7 @@ dsh plugin --profile web add github:SuCriss/dsh-version-update
 ## 开发
 
 ```sh
-npm test          # node:test，150 个用例覆盖协议/域逻辑/路由/组装/浏览器控制器/重启助手
+npm test          # node:test，152 个用例覆盖协议/域逻辑/路由/组装/浏览器控制器/重启助手
 npm run typecheck # tsc --checkJs strict，无构建产物的类型安全
 ```
 

@@ -558,6 +558,60 @@ test('install settles into a cancellable countdown; restart reloads when ready',
   }
 })
 
+/**
+ * The minimum `document` the stylesheet installer touches: creation, one head,
+ * and a querySelector that understands only the selector it was asked to match.
+ */
+function fakeDocument() {
+  /** @type {{ dataset: Record<string, string>, textContent: string, removed: boolean, remove(): void }[]} */
+  const tags = []
+  return {
+    tags,
+    createElement: () => {
+      const tag = { dataset: {}, textContent: '', removed: false }
+      tag.remove = () => { tag.removed = true }
+      return tag
+    },
+    head: { appendChild: (tag) => { tags.push(tag) } },
+    querySelector: (selector) => {
+      const id = /data-plugin-css="([^"]+)"/.exec(String(selector))?.[1]
+      if (id === undefined) return null
+      return tags.find(tag => !tag.removed && tag.dataset.pluginCss === id) ?? null
+    },
+  }
+}
+
+test('the stylesheet is released by the last mounting, not the first', async () => {
+  const client = await loadClient()
+  const doc = fakeDocument()
+  globalThis.document = doc
+  try {
+    // A hot swap usually mounts the new page before disposing the old one, so the
+    // second claim arrives while the tag exists and takes no ownership of it. The
+    // old disposer running first must not cost the survivor its rules.
+    const first = client.installStyles()
+    const second = client.installStyles()
+    assert.equal(doc.tags.length, 1, 'one page, one tag')
+    first()
+    assert.equal(doc.tags[0].removed, false, 'a mounting still holding the sheet keeps it')
+    second()
+    assert.equal(doc.tags[0].removed, true, 'the last claimant releases it')
+
+    // A disposer that runs twice must not under-count the claims...
+    second()
+    assert.equal(doc.tags[0].removed, true)
+    // ...which is what a later mount would otherwise discover by finding itself
+    // styled by nothing: the count has to have reached zero for real.
+    const third = client.installStyles()
+    assert.equal(doc.tags.length, 2, 'a mount after full release inserts again')
+    assert.equal(doc.tags[1].removed, false)
+    third()
+    assert.equal(doc.tags[1].removed, true)
+  } finally {
+    delete globalThis.document
+  }
+})
+
 test('deleting a snapshot takes two clicks on the same row', async () => {
   const client = await loadClient()
   const overlay = fakeOverlay()

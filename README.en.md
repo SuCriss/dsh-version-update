@@ -93,7 +93,7 @@ Runtime behavior (mode, tracking, window, schedule) lives in the policy file edi
 ## Development
 
 ```sh
-npm test          # node:test — 150 cases across protocol/domain/routes/composition/browser controller/relaunch helper
+npm test          # node:test — 152 cases across protocol/domain/routes/composition/browser controller/relaunch helper
 npm run typecheck # tsc --checkJs strict — type safety without a build step
 ```
 

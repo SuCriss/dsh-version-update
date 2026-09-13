@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -290,6 +290,31 @@ test('a snapshot delete unlinks that version, leaves the tree alone, and writes 
   const again = await invoke(ctx.registered, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.4.0' } })
   assert.equal(again.status, 409)
   assert.match(String(again.body.error), /no snapshot of 0\.4\.0/)
+})
+
+test('the panel sees a trail another host rewrote without changing its size', async (t) => {
+  const { dataDir } = environment(t)
+  const historyPath = join(dataDir, 'history.json')
+  // appendHistory's own wire format, so a second entry of the same width is the
+  // same number of bytes: the trail is capped and rewritten whole, which is
+  // exactly how a size-only cache key goes stale.
+  const entry = to => `${JSON.stringify([{ at: 1, to, result: 'ok' }], null, 1)}\n`
+  writeFileSync(historyPath, entry('0.3.0'), 'utf8')
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+
+  const first = await invoke(ctx.registered, VERSION_API.status)
+  assert.deepEqual(first.body.result.recent.map(item => item.to), ['0.3.0'])
+
+  writeFileSync(historyPath, entry('0.3.1'), 'utf8')
+  assert.equal(readFileSync(historyPath, 'utf8').length, entry('0.3.0').length, 'the rewrite preserved the size')
+  // A filesystem that resolves writes coarsely could report the same mtime for
+  // both; setting it explicitly is what makes this a test of the key rather than
+  // of how fast this machine happens to be.
+  utimesSync(historyPath, new Date(2000), new Date(2000))
+
+  const second = await invoke(ctx.registered, VERSION_API.status)
+  assert.deepEqual(second.body.result.recent.map(item => item.to), ['0.3.1'], 'the moved stamp was enough to re-read')
 })
 
 test('a restore yields to another host that holds the machine-wide lock', async (t) => {

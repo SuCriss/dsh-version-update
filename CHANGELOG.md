@@ -3,6 +3,24 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.1.8] - 2026-09-12
+
+### Fixed
+
+- **A hot swap could strip the stylesheet from the page that survived it.** The
+  installer checked whether its `<style>` tag already existed and, finding it,
+  handed back a do-nothing disposer. That is right about leaking and wrong about
+  removal: the new mounting usually runs before the old one is disposed, so it took
+  no ownership and the old disposer then removed the rules out from under the
+  instance left alive — an unstyled settings page. Claims are counted now, and only
+  the last one releases the tag; a disposer that runs twice cannot under-count.
+- **The polling routes re-read and re-parsed the whole audit trail every tick.**
+  Those facts ride every answer, and `appendHistory` rewrites the file whole, so a
+  panel poll cost a read plus a JSON.parse every 800 ms in the same process that is
+  pumping npm's output. The summary is now reused while the file's `(mtime, size)`
+  is unchanged, and dropped on this host's own writes — the repair path can record
+  twice in one millisecond, and a capped rewrite can land on the same size.
+
 ## [1.1.7] - 2026-09-12
 
 ### Added
