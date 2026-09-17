@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { VERSION_API, DEFAULT_POLICY } from '../lib/protocol.js'
 import { apply } from '../lib/index.js'
+import { createSnapshot } from '../lib/snapshot.js'
 
 /**
  * A fake cordis context recording route registrations and effects. `register`
@@ -83,6 +84,41 @@ async function invoke(routes, path, opts = {}) {
   return res
 }
 
+test('host wiring lists snapshot bytes, deletes the selected copy and reads its fixed restart log', async (t) => {
+  const { installDir, dataDir } = environment(t)
+  const snapshotsDir = join(dataDir, 'snapshots')
+  assert.equal(createSnapshot({ installDir, snapshotsDir, version: '0.4.0' }).ok, true)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+  const listed = await invoke(ctx.registered, VERSION_API.snapshots)
+  assert.ok(listed.body.result.snapshots[0].bytes > 0)
+  const deleted = await invoke(ctx.registered, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(deleted.status, 200)
+  assert.deepEqual(deleted.body.result.snapshots, [])
+  assert.equal(existsSync(join(snapshotsDir, '0.4.0')), false)
+  writeFileSync(join(dataDir, 'restart.log'), 'handoff ready\n')
+  const log = await invoke(ctx.registered, VERSION_API.restartDiagnostics)
+  assert.equal(log.body.result.log, 'handoff ready\n')
+})
+
+test('host manual-check wiring updates lastCheck under auto policy without starting npm', async (t) => {
+  const { dataDir } = environment(t)
+  const oldFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = oldFetch })
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({
+    'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {} },
+  }) })
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+  await invoke(ctx.registered, VERSION_API.policy, { method: 'POST', body: { mode: 'auto' } })
+  const checked = await invoke(ctx.registered, VERSION_API.checkRun, { method: 'POST' })
+  assert.equal(checked.body.result.lastCheck.target, '0.5.0')
+  assert.equal(checked.body.result.task.state, 'idle')
+  assert.equal(checked.body.result.pendingAuto, undefined)
+})
+
 test('apply mounts the full core family; notes stay off without a repo slug', (t) => {
   const { dataDir } = environment(t)
   const ctx = fakeCtx()
@@ -90,6 +126,9 @@ test('apply mounts the full core family; notes stay off without a repo slug', (t
   const paths = ctx.registered.map(route => route.path).sort()
   assert.deepEqual(paths, [
     VERSION_API.check,
+    VERSION_API.checkRun,
+    VERSION_API.snapshotDelete,
+    VERSION_API.restartDiagnostics,
     VERSION_API.policy,
     VERSION_API.restart,
     VERSION_API.restartCancel,

@@ -3,20 +3,87 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
-## [1.0.8]
+## [Unreleased]
+
+### Added
+
+- Snapshot deletion with confirmation, install-busy protection and protection
+  for the running version's recovery copy while a restart is pending. New
+  snapshots display their payload size in the panel.
+- Version-2 snapshot inventories record file paths, sizes and symbolic-link
+  targets. Listing and restoration check these against the stored copy; missing
+  or resized files prevent restoration before the live tree is touched.
+  Legacy snapshots remain metadata-validated and are labelled as such; their
+  size may be unknown. This is not a cryptographic content-integrity guarantee.
+- `POST /check/run` records a policy-aware manual check without installing or
+  parking an automatic task. The panel's check button uses this endpoint.
+- On-demand restart diagnostics from a fixed `restart.log` in the plugin state
+  directory, retained across host restarts. Responses are limited to a 16 KiB /
+  100-line tail and redact common credential patterns; review before sharing.
+- npm CLI discovery failures include advice based on observed pnpm/Corepack/
+  npm-exec signals. EACCES/EPERM install failures retain the npm log and show
+  ownership, prefix, cache and file-lock troubleshooting without auto-elevation.
+
+### Performance and reliability
+
+- Show local installed/task/history facts from `/status` while the registry
+  check is pending; running tasks begin polling without waiting for registry
+  metadata. The full `/check` response still supplies the version list.
+- Bound the release-notes cache to 32 entries with LRU eviction and the existing
+  TTL. Cache hits refresh recency without extending the TTL.
+- Transfer ownership of the stylesheet during overlapping fiber reloads and
+  refresh its CSS; disposing the old fiber cannot remove the adopted tag.
+- Return retained retired-directory entries from tree repair, avoiding the
+  extra inspection previously performed by the host after repair.
+- Use the scheduler's injected clock for check and parked-finding timestamps.
 
 ### Fixed
 
-- **A slow install is no longer killed into a half-committed global tree.**
-  The old 10-minute wall-clock cap stopped npm wherever it happened to be —
-  and npm mid-reify holds every replaced package under a retired temporary
-  name (`.name-hash`) that is only deleted when the run finishes. A kill at
-  that moment left the global installation half-committed (222 retired
-  folders under `@deepseek-ai/`, dsh itself possibly renamed away), which
-  broke the Web GUI until it was repaired by hand. The 10-minute mark is now
-  a SOFT deadline: the log notes the slowness and npm keeps running. Only a
-  hard ceiling (`INSTALL_HARD_TIMEOUT_MS`, one hour) stops a run that is
-  assumed wedged rather than working.
+- **A parked auto install can no longer outlive the policy that produced it.**
+  A version found outside the execution window waits for its window; if the user
+  turned automation OFF (or pinned the version) while it waited, the wake-up
+  fired anyway and installed the stale target — behind the back of a policy that
+  no longer wanted it. The parked finding is now re-validated when it wakes: the
+  policy must still say `auto`, and its tracking rule must still resolve to the
+  same version. A cycle that runs while automation is off also drops any finding
+  an earlier policy parked.
+- **A parked auto install is retried instead of stranded.** Two timers were
+  wrong whenever the single install slot was busy at the moment of the attempt:
+  with no execution window configured, the parked finding armed NO wake-up at
+  all and was never retried (only the next daily check or a host restart could
+  revive it); with a window, the retry was armed for the NEXT opening — up to a
+  day away, even though the install could legally run right then. Both now
+  retry after `AUTO_RETRY_MS` (one minute). A window moved while a finding
+  waited also re-arms for the new opening instead of leaving it parked.
+- **The policy form keeps unsaved edits across background refreshes.** The page
+  rebuilds the policy object on every render (it adds a display-only next-check
+  hint), and the form reset its draft whenever that object changed — which a
+  running install does every 800 ms, wiping whatever the user had just typed.
+  The draft now resets only when one of the policy's editable values changes.
+- **The history file is written atomically.** An append wrote the file in
+  place, so a crash mid-write left truncated JSON that the tolerant reader
+  interprets as "no history at all" — losing the whole audit trail. Appends go
+  through a temp file plus a same-directory rename, like the policy store.
+- **A snapshot restore can no longer race an install from another fiber.** The
+  restore route refused only while the runner's own task read `running`; after a
+  plugin-fiber reload, a replacement runner reports `idle` while the previous
+  fiber's npm still reifies the tree. The runner now exposes a process-wide
+  `isBusy()` probe (task, pre-spawn snapshot window, and orphaned npm alike),
+  and the restore guard consults it.
+- **An invalid `mode` no longer normalizes to `mode: undefined`.** Every other
+  policy field group keeps its base value when a submission is rejected; `mode`
+  left the field unset, so a caller that ignored `ok` could persist a policy the
+  scheduler could never act on.
+
+### Changed
+
+- The protocol contract has its own test file (`test/protocol.test.js`), which
+  `npm test` had been listing all along — node's runner silently skips a
+  missing file among several, so the phantom entry never failed a run. Time
+  windows, the daily check time, and policy normalization are now pinned
+  directly instead of only through the store, the routes, and the panel.
+
+## [1.0.8]
 
 ### Added
 

@@ -29,6 +29,17 @@ function snapHome(t) {
   return snapshotsDir
 }
 
+test('snapshot inventory reports bytes and refuses a missing payload before touching live files', (t) => {
+  const installDir = fakeInstall(t, '1.2.3')
+  const snapshotsDir = snapHome(t)
+  assert.equal(createSnapshot({ installDir, snapshotsDir, version: '1.2.3' }).ok, true)
+  assert.ok(listSnapshots(snapshotsDir)[0].bytes > 0)
+  rmSync(join(snapshotsDir, '1.2.3', 'lib', 'bin.js'))
+  const outcome = restoreSnapshot({ installDir, snapshotsDir, version: '1.2.3' })
+  assert.equal(outcome.ok, false)
+  assert.ok(existsSync(join(installDir, 'lib', 'bin.js')))
+})
+
 test('defaultSnapshotsDir lives under the given home', () => {
   assert.equal(defaultSnapshotsDir({ home: '/h' }), join('/h', '.dsh-version-update', 'snapshots'))
 })

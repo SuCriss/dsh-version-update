@@ -124,11 +124,13 @@ test('the freshness guard leaves young retirements alone on the boot path', () =
 
     const guarded = repairTree({ installDir, snapshotsDir: join(base, 'snapshots'), minAgeMs: RETIRED_MIN_AGE_MS })
     assert.equal(guarded.removed, 0, 'young retirements are reported, not deleted')
+    assert.deepEqual(guarded.leftovers.map(entry => entry.name), ['.fresh-99999999'])
     assert.equal(existsSync(join(installDir, 'node_modules', '.fresh-99999999')), true)
 
     // Once npm provably settled, the same leftover is removed unconditionally.
     const ungated = repairTree({ installDir, snapshotsDir: join(base, 'snapshots'), minAgeMs: 0 })
     assert.equal(ungated.removed, 1)
+    assert.deepEqual(ungated.leftovers, [], 'removed directories are not reported as survivors')
     assert.equal(existsSync(join(installDir, 'node_modules', '.fresh-99999999')), false)
   } finally {
     rmSync(base, { recursive: true, force: true })

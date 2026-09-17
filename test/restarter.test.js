@@ -5,7 +5,8 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { readRestartDiagnostics, RESTART_LOG_BYTES } from '../lib/restart-log.js'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AUTO_RESTART_DELAY_MS, MANUAL_RESTART_GRACE_MS, createRestarter, parseRequestedPort, resolveLauncher } from '../lib/restarter.js'
@@ -46,6 +47,20 @@ function harness(overrides = {}) {
     },
   }
 }
+
+test('restart diagnostic reads are bounded and redact common credentials', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vu-log-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const path = join(dir, 'restart.log')
+  assert.equal(readRestartDiagnostics(path).available, false)
+  writeFileSync(path, 'old\n'.repeat(10000) + 'token=private-value\nhttps://user:pass@example.org\nready\n')
+  const result = readRestartDiagnostics(path)
+  assert.equal(result.available, true)
+  assert.equal(result.truncated, true)
+  assert.ok(Buffer.byteLength(result.log) <= RESTART_LOG_BYTES)
+  assert.doesNotMatch(result.log, /private-value|user:pass/)
+  assert.match(result.log, /ready/)
+})
 
 test('parseRequestedPort reads both --port N and --port=N forms', () => {
   assert.equal(parseRequestedPort(['node', 'bin.js', '--port', '3080']), 3080)

@@ -16,6 +16,7 @@ import {
   readInstalled,
   resolveTarget,
   repositorySlug,
+  createNotesReader,
 } from '../lib/core.js'
 
 test('compareVersions orders releases and pre-releases by semver rules', () => {
@@ -133,4 +134,39 @@ test('parseVersion exposes comparable parts shared with the browser mirror', () 
   assert.deepEqual(parseVersion('1.2.3'), { core: [1, 2, 3], pre: [] })
   assert.deepEqual(parseVersion('1.2.3-rc.1'), { core: [1, 2, 3], pre: ['rc', '1'] })
   assert.equal(parseVersion('nope'), undefined)
+})
+
+test('the notes reader caches per version, honours the TTL, and evicts least-recently-used', async () => {
+  const clock = { at: 1000 }
+  const fetches = []
+  const reader = createNotesReader({
+    fetchImpl: async () => {
+      fetches.push(fetches.length + 1)
+      return { ok: true, json: async () => ({ body: `notes-${fetches.length}`, html_url: 'https://x' }) }
+    },
+    ttlMs: 1000,
+    maxEntries: 2,
+    now: () => clock.at,
+  })
+
+  await reader('o/r', '1.0.0')
+  await reader('o/r', '1.0.0')
+  assert.equal(fetches.length, 1, 'a warm version is served from the cache')
+
+  clock.at = 5000 // past the TTL
+  await reader('o/r', '1.0.0')
+  assert.equal(fetches.length, 2, 'an expired entry is refetched')
+  assert.equal((await reader('o/r', '1.0.0')).notes, 'notes-2')
+
+  await reader('o/r', '2.0.0') // cache: [1.0.0, 2.0.0]
+  await reader('o/r', '3.0.0') // over the cap: the oldest (1.0.0) goes
+  assert.equal(fetches.length, 4)
+
+  await reader('o/r', '3.0.0')
+  assert.equal(fetches.length, 4, 'the newest entries stay cached')
+
+  await reader('o/r', '1.0.0') // was evicted
+  await reader('o/r', '3.0.0')
+  await reader('o/r', '2.0.0') // was evicted when 1.0.0 was re-read
+  assert.equal(fetches.length, 6)
 })

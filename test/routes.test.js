@@ -80,6 +80,41 @@ function harness(overrides = {}) {
 /** Every fake installation this file created, reclaimed by the final test. */
 const tempDirs = []
 
+test('snapshot deletion validates input, refuses busy installs and removes only the selected snapshot', async () => {
+  let busy = false
+  const removed = []
+  const { routes } = harness({ deps: {
+    updater: { view: () => ({ state: 'idle', log: '' }), isBusy: () => busy, start: () => ({}) },
+    snapshots: { list: () => [], restore: () => ({ ok: true }), remove: version => { removed.push(version); return true } },
+  } })
+  const request = version => invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', body: { version } })
+  assert.equal((await request('../bad')).status, 400)
+  busy = true
+  assert.equal((await request('0.3.0')).status, 409)
+  assert.deepEqual(removed, [])
+  busy = false
+  assert.equal((await request('0.3.0')).body.result.deleted, '0.3.0')
+  assert.deepEqual(removed, ['0.3.0'])
+  assert.equal((await invoke(routes, VERSION_API.snapshotDelete, { method: 'GET' })).status, 405)
+  assert.equal((await invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', fenced: false })).status, 403)
+})
+
+test('manual check and restart diagnostics use their injected operations', async () => {
+  let checked = 0
+  const { routes, started } = harness({ deps: {
+    manualCheck: async () => { checked += 1; return { distTags: { latest: '0.5.0' }, versions: ['0.5.0'] } },
+    ambient: () => ({ lastCheck: { at: 42, target: '0.5.0' } }),
+    restartDiagnostics: () => ({ available: true, log: 'handoff ready', truncated: false }),
+  } })
+  const response = await invoke(routes, VERSION_API.checkRun, { method: 'POST' })
+  assert.equal(response.body.result.lastCheck.at, 42)
+  assert.equal(checked, 1)
+  assert.deepEqual(started, [])
+  const diagnostic = await invoke(routes, VERSION_API.restartDiagnostics, { query: '?path=ignored' })
+  assert.equal(diagnostic.body.result.log, 'handoff ready')
+  assert.equal((await invoke(routes, VERSION_API.restartDiagnostics, { fenced: false })).status, 403)
+})
+
 test('the full route family registers; optional routes appear only when wired', () => {
   const full = harness({
     deps: {
@@ -98,7 +133,7 @@ test('the full route family registers; optional routes appear only when wired', 
   // only notes/policy/snapshots appear when their operations are wired.
   const bare = harness()
   assert.deepEqual(bare.routes.map(r => r.path).sort(), [
-    VERSION_API.check, VERSION_API.restart, VERSION_API.restartCancel, VERSION_API.status, VERSION_API.update,
+    VERSION_API.check, VERSION_API.checkRun, VERSION_API.restart, VERSION_API.restartCancel, VERSION_API.restartDiagnostics, VERSION_API.status, VERSION_API.update,
   ])
 })
 
@@ -340,4 +375,50 @@ test('restore refuses while an install is writing the tree', async () => {
   })
   const res = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
   assert.equal(res.status, 409)
+})
+test('restore refuses while an install is writing the tree', async () => {
+  const { routes } = harness({
+    deps: {
+      snapshots: { list: () => [], restore: () => ({ ok: true }) },
+    },
+    taskView: () => ({ state: 'running', log: '' }),
+  })
+  const res = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 409)
+})
+
+test('restore refuses while a runner from another fiber holds the tree', async () => {
+  // A plugin-fiber reload replaces the runner: the replacement's own task reads
+  // `idle` while the previous fiber's npm still reifies. The process-wide probe
+  // is the only way the restore guard can see that.
+  const { routes } = harness({
+    deps: {
+      snapshots: { list: () => [{ version: '0.4.0', usable: true }], restore: () => ({ ok: true }) },
+      updater: {
+        view: () => ({ state: 'idle', log: '' }),
+        isBusy: () => true,
+        start: () => ({ state: 'running', log: '' }),
+      },
+    },
+  })
+  const res = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 409)
+  assert.match(res.body.error, /install is in progress/)
+})
+
+test('restore works through a runner that has no process-wide probe', async () => {
+  // Backwards compatibility: a runner exposing only view/start (a test fake, or
+  // an embedder's stand-in) still gets the task-state guard, never a 500.
+  const { routes } = harness({
+    deps: {
+      snapshots: { list: () => [{ version: '0.4.0', usable: true }], restore: () => ({ ok: true }) },
+      updater: {
+        view: () => ({ state: 'idle', log: '' }),
+        start: () => ({ state: 'running', log: '' }),
+      },
+    },
+  })
+  const res = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.restored, '0.4.0')
 })

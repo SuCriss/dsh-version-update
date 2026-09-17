@@ -207,10 +207,136 @@ test('an HTML fallback is diagnosed as not-mounted instead of HTTP 200', async (
   assert.equal(controller.getSnapshot().error, 'notMounted')
 })
 
+test('the local view renders the moment /status answers, before the slow registry read', async () => {
+  const client = await loadClient()
+  // The registry read is stalled deliberately; /status answers at once. The
+  // panel shows the installed version and the history without waiting for the
+  // network — what an offline machine would otherwise stare at for ~30 s.
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  fakeFetch({
+    '/status': () => json({ result: {
+      state: 'idle', log: '',
+      running: '0.4.0', installed: '0.4.0', stale: false, needsRestart: false,
+      lastCheck: { at: 42 }, recent: [{ at: 1, to: '0.4.0', result: 'ok' }],
+    } }),
+    '/check': async () => {
+      await gate
+      return json({ result: {
+        installed: '0.4.0', installDir: '/i',
+        channels: [{ channel: 'latest', version: '0.5.0', ahead: true }],
+        versions: ['0.5.0', '0.4.0'],
+        task: { state: 'idle', log: '' },
+        lastCheck: { at: 42 }, recent: [{ at: 1, to: '0.4.0', result: 'ok' }],
+      } })
+    },
+    '/snapshots': () => json({ result: { snapshots: [] } }),
+  }).install()
+  const controller = client.createController({ t })
+  const checking = controller.check()
+  await flush()
+  const early = controller.getSnapshot()
+  assert.equal(early.installed, '0.4.0', 'the installed version is visible before the registry answers')
+  assert.equal(early.history.length, 1, 'the recent activity is visible too')
+  assert.equal(early.status, 'loading', 'the registry read is still in flight')
+
+  release()
+  await checking
+  const settled = controller.getSnapshot()
+  assert.equal(settled.status, 'ready')
+  assert.equal(settled.channels[0].version, '0.5.0', 'the registry view arrives when it arrives')
+})
+
+test('a failing /status during the load is silent; /check reports the failure', async () => {
+  const client = await loadClient()
+  let localCalls = 0
+  fakeFetch({
+    '/status': () => { localCalls += 1; return json({ error: 'nope' }, 500) },
+    '/check': () => json({ error: 'registry unreachable' }, 502),
+  }).install()
+  const controller = client.createController({ t })
+  await controller.check()
+  assert.equal(localCalls, 1)
+  const s = controller.getSnapshot()
+  assert.equal(s.status, 'error')
+  assert.equal(s.error, 'registry unreachable', 'the registry failure is the reported one')
+  assert.equal(s.installed, undefined, 'no local fact was applied from the failed probe')
+})
+
+test('a running install found by the early /status starts its poll at once', async (ctx) => {
+  const client = await loadClient()
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  let statusCalls = 0
+  fakeFetch({
+    '/status': () => {
+      statusCalls += 1
+      return json({ result: {
+        state: 'running', version: '9.9.9', log: 'installing',
+        running: '0.4.0', installed: '0.4.0', stale: false, needsRestart: false,
+        recent: [],
+      } })
+    },
+    '/check': async () => {
+      await gate
+      return json({ result: { installed: '0.4.0', task: { state: 'running', version: '9.9.9', log: '' } } })
+    },
+    '/snapshots': () => json({ result: { snapshots: [] } }),
+  }).install()
+  ctx.mock.timers.enable({ apis: ['setTimeout'] })
+  const controller = client.createController({ t })
+  const checking = controller.check()
+  try {
+    await flush()
+    assert.equal(controller.getSnapshot().task.state, 'running', 'the running task is visible early')
+    assert.equal(controller.getSnapshot().task.needsRestart, false)
+    const firstPolls = statusCalls
+    ctx.mock.timers.tick(800)
+    await flush()
+    assert.equal(statusCalls, firstPolls + 1, 'polling does not wait for /check')
+  } finally {
+    release()
+    await checking
+    controller.dispose()
+    ctx.mock.timers.reset()
+  }
+})
+
+test('snapshot deletion requires confirmation and diagnostics load on demand', async (ctx) => {
+  const client = await loadClient()
+  const requests = []
+  const oldFetch = globalThis.fetch
+  ctx.after(() => { globalThis.fetch = oldFetch })
+  globalThis.fetch = async (path, options) => {
+    requests.push({ path, options })
+    if (path.endsWith('/snapshots/delete')) return json({ result: { deleted: '1.0.0', snapshots: [] } })
+    return json({ result: { available: true, log: 'ready', truncated: false } })
+  }
+  const controller = client.createController({ t })
+  ctx.after(() => controller.dispose())
+  controller.requestDeleteSnapshot('1.0.0')
+  assert.equal(requests.length, 0)
+  controller.cancelDeleteSnapshot()
+  await controller.confirmDeleteSnapshot()
+  assert.equal(requests.length, 0)
+  controller.requestDeleteSnapshot('1.0.0')
+  await controller.confirmDeleteSnapshot()
+  assert.equal(requests[0].options.method, 'POST')
+  assert.deepEqual(JSON.parse(requests[0].options.body), { version: '1.0.0' })
+  assert.equal(controller.getSnapshot().deleteConfirm, undefined)
+  assert.equal(controller.getSnapshot().busy, false)
+  await controller.loadRestartDiagnostics()
+  assert.equal(controller.getSnapshot().diagnostics.log, 'ready')
+  globalThis.fetch = async () => json({ error: 'denied' }, 409)
+  controller.requestDeleteSnapshot('1.0.0')
+  await controller.confirmDeleteSnapshot()
+  assert.equal(controller.getSnapshot().snapshotError, 'denied')
+})
+
 test('check with prompt offers an ahead update for confirmation', async () => {
   const client = await loadClient()
   fakeFetch({
-    '/check': () => json({ result: {
+    '/check/run': () => json({ result: {
       installed: '0.4.0',
       installDir: '/i',
       channels: [{ channel: 'latest', version: '0.5.0', ahead: true }],
@@ -433,5 +559,75 @@ test('restore confirms, applies, and walks the same restart flow', async (ctx) =
     assert.equal(reloaded, 1, 'the restore walked the full restart chain')
   } finally {
     ctx.mock.timers.reset()
+  }
+})
+
+test('style adoption keeps the new fiber styled when the old one disposes', async (ctx) => {
+  const client = await loadClient()
+  let tag = null
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  ctx.after(() => {
+    if (original) Object.defineProperty(globalThis, 'document', original)
+    else delete globalThis.document
+  })
+  globalThis.document = {
+    querySelector: () => tag,
+    createElement: () => ({ dataset: {}, textContent: '', remove() { tag = null } }),
+    head: { appendChild(node) { tag = node } },
+  }
+  const disposeOld = client.installStyles()
+  const originalTag = tag
+  tag.textContent = 'obsolete CSS'
+  const disposeNew = client.installStyles()
+  assert.equal(tag, originalTag, 'the tag is reused')
+  assert.notEqual(tag.textContent, 'obsolete CSS', 'adoption refreshes its CSS')
+  disposeOld()
+  assert.equal(tag, originalTag, 'old disposal cannot remove the adopted tag')
+  disposeNew()
+  assert.equal(tag, null, 'the current owner cleans up')
+})
+
+test('the policy form only resets its draft when a policy VALUE changes', async () => {
+  const client = await loadClient()
+  const saved = {
+    mode: 'auto',
+    track: { kind: 'tag', tag: 'latest' },
+    window: { start: '22:00', end: '06:00' },
+    restart: 'ask',
+    checkAt: '04:00',
+  }
+
+  // The page rebuilds the policy object on every render, adding a display-only
+  // next-check hint. That must read as the SAME policy, or every background
+  // poll would wipe whatever the user has typed half a second after they typed
+  // it — and a running install polls every 800 ms.
+  const rerendered = { ...saved, nextCheckHint: 'next check 04:00' }
+  assert.equal(
+    client.policyDraftKey(rerendered),
+    client.policyDraftKey(saved),
+    'a render-only field must not reset the draft',
+  )
+
+  // Every editable field changing does reset the draft, so the host's value —
+  // possibly edited in another panel or normalized by the host — takes over.
+  const changed = [
+    { ...saved, mode: 'notify' },
+    { ...saved, track: { kind: 'pin' } },
+    { ...saved, track: { kind: 'tag', tag: 'next' } },
+    { ...saved, track: { kind: 'line', range: '^1.0.0' } },
+    { ...saved, track: { kind: 'line', range: '^2.0.0' } },
+    { ...saved, window: null },
+    { ...saved, window: { start: '22:00', end: '07:00' } },
+    { ...saved, window: { start: '23:00', end: '06:00' } },
+    { ...saved, restart: 'auto' },
+    { ...saved, checkAt: null },
+    { ...saved, checkAt: '05:00' },
+  ]
+  for (const candidate of changed) {
+    assert.notEqual(
+      client.policyDraftKey(candidate),
+      client.policyDraftKey(saved),
+      JSON.stringify(candidate),
+    )
   }
 })

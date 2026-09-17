@@ -58,6 +58,7 @@ Three halves in one package:
   - `POST /update` — `{version}` starts one install (trigger always recorded as manual)
   - `GET /status` — task view (`running`/`stale`/`needsRestart`/`restartable`) + ambient
   - `POST /restart` — three-step handoff
+  - `POST /restart/cancel` — disarms the host-side fallback restart (the panel calls it on "later")
   - `GET /notes?version=` — GitHub release notes (mounted when enabled and a repo is known)
   - `GET|POST /policy` — read / patch the policy; every rejected field is named in a 400
   - `GET /snapshots`, `POST /restore` — list & restore (refused while an install runs)
@@ -89,10 +90,19 @@ Restart `dsh web` once so the host half mounts; until then the panel says so exp
 
 Runtime behavior (mode, tracking, window, schedule) lives in the policy file edited from the panel, not entry config.
 
+## Management and diagnostics additions
+
+- New snapshots show payload size and support confirmed deletion. Deletion is blocked during installation and for the running version's recovery copy while restart is pending.
+- New inventories verify file paths, sizes and symlink targets before restoration. This is not content hashing. Legacy snapshots remain metadata-validated, explicitly labelled, and may have unknown size.
+- The check button uses `POST /check/run` to record a policy-aware verdict. Manual checks never install or create parked automatic jobs, even in auto mode.
+- Restart diagnostics read the fixed state-directory `restart.log` on demand, limited to a 16 KiB / 100-line tail with common credential patterns redacted. Review local paths and other details before sharing.
+- Missing npm and EACCES/EPERM failures offer terminal, prefix, cache-permission and file-lock guidance without automatic elevation.
+- New loopback-only endpoints under `/api/dsh-version-update`: `POST /snapshots/delete` (`{version}`), `POST /check/run`, `GET /restart/diagnostics`.
+
 ## Development
 
 ```sh
-npm test          # node:test — 83 cases across protocol/domain/routes/composition/browser controller
+npm test          # node:test — protocol/domain/routes/composition/browser controller
 npm run typecheck # tsc --checkJs strict — type safety without a build step
 ```
 

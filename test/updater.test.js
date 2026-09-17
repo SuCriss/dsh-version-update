@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { EventEmitter } from 'node:events'
-import { createUpdater, resolveNpmCli } from '../lib/updater.js'
+import { createUpdater, resolveNpmCli, npmMissingAdvice } from '../lib/updater.js'
 
 /**
  * A fake spawned child: enough of ChildProcess for the runner's listeners.
@@ -41,6 +41,27 @@ function spawnStub() {
   }
   return Object.assign(stub, { calls })
 }
+
+test('missing npm advice distinguishes observed environments', () => {
+  assert.match(npmMissingAdvice({ PNPM_HOME: '/pnpm' }, '/node'), /pnpm was detected/)
+  assert.match(npmMissingAdvice({ COREPACK_ROOT: '/corepack' }, '/node'), /Corepack was detected/)
+  assert.match(npmMissingAdvice({ npm_command: 'exec' }, '/node'), /temporary installation/)
+  assert.doesNotMatch(npmMissingAdvice({}, '/node'), /was detected/)
+})
+
+test('permission failures preserve logs and surface actionable advice', (t) => {
+  const spawn = spawnStub()
+  const updater = createUpdater({ spawnImpl: spawn, npmCli: '/n' })
+  t.after(() => updater.dispose())
+  updater.start('1.2.3')
+  const child = spawn.calls[0].child
+  child.stderr.emit('data', 'npm ERR! code EACCES /global/package\n')
+  child.exitCode = 1
+  child.emit('close', 1)
+  assert.match(updater.view().error, /Permission denied/)
+  assert.match(updater.view().error, /user-owned prefix/)
+  assert.match(updater.view().log, /EACCES \/global\/package/)
+})
 
 test('resolveNpmCli probes node-adjacent roots then configured prefixes', () => {
   // Every case passes an explicit `env`. Omitting it falls through to the real
@@ -278,4 +299,63 @@ test('the retained log tail respects LOG_LIMIT', async (t) => {
   const logText = updater.view().log
   assert.ok(logText.length <= LOG_LIMIT)
   assert.ok(logText.includes('TAIL'), 'the newest output survives the cap')
+})
+test('isBusy reports the process-wide slot, not just this instance', async (t) => {
+  const idle = createUpdater({ spawnImpl: spawnStub(), npmCli: '/n' })
+  assert.equal(idle.isBusy(), false, 'an idle runner with no run in the process is free')
+
+  const spawnA = spawnStub()
+  const first = createUpdater({ spawnImpl: spawnA, npmCli: '/n' })
+  first.start('1.0.0')
+  const child = spawnA.calls[0].child
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.exitCode = 0
+      child.emit('close', 0)
+    }
+  })
+  assert.equal(first.isBusy(), true, 'a running install is busy')
+
+  // A replacement instance — what a plugin-fiber reload builds — reports its
+  // OWN task as idle while the previous fiber's npm still writes the tree. This
+  // is the case the restore guard exists for.
+  const second = createUpdater({ spawnImpl: spawnStub(), npmCli: '/n' })
+  assert.equal(second.view().state, 'idle')
+  assert.equal(second.isBusy(), true, 'the orphaned run keeps the tree busy for every runner')
+
+  // Settlement frees it for the replacement instance too.
+  child.exitCode = 0
+  child.emit('close', 0)
+  await Promise.resolve()
+  assert.equal(second.isBusy(), false)
+  assert.equal(first.isBusy(), false)
+})
+
+test('isBusy covers the pre-spawn preparation window', async (t) => {
+  const spawn = spawnStub()
+  let release = () => {}
+  const gate = new Promise(resolve => { release = () => { resolve(undefined) } })
+  const updater = createUpdater({
+    spawnImpl: spawn,
+    npmCli: '/n',
+    beforeSpawn: async () => { await gate },
+  })
+  t.after(() => updater.dispose())
+
+  updater.start('2.0.0')
+  // The rollback snapshot is still copying: npm has not been spawned, yet the
+  // tree is already spoken for — a restore starting now would race the copy.
+  assert.equal(spawn.calls.length, 0)
+  assert.equal(updater.isBusy(), true, 'a snapshot being written holds the tree')
+
+  release()
+  await new Promise(resolve => { setTimeout(resolve, 10) })
+  assert.equal(spawn.calls.length, 1)
+  assert.equal(updater.isBusy(), true, 'the spawned npm takes over the claim')
+
+  // Settle so the shared process-wide slot frees for the following tests.
+  spawn.calls[0].child.exitCode = 0
+  spawn.calls[0].child.emit('close', 0)
+  await Promise.resolve()
+  assert.equal(updater.isBusy(), false)
 })

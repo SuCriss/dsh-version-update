@@ -58,6 +58,7 @@ DeepSeek Harness Web GUI 的「版本更新」设置菜单 —— v1.0 全面重
   - `POST /update` — `{version}` 启动一次安装（trigger 固定记为 manual）
   - `GET /status` — 任务视图（`running`/`stale`/`needsRestart`/`restartable`）+ ambient
   - `POST /restart` — 三步交接重启
+  - `POST /restart/cancel` — 解除宿主侧兜底重启（面板选「稍后」时调用）
   - `GET /notes?version=` — GitHub 发布说明（`releaseNotes` 开启且能解析出仓库时挂载）
   - `GET|POST /policy` — 读取 / 打补丁式修改策略（校验失败的每个字段都会被点名，400 返回）
   - `GET /snapshots`、`POST /restore` — 快照列表与恢复（安装进行中拒绝恢复）
@@ -89,10 +90,19 @@ dsh plugin --profile web add github:SuCriss/dsh-version-update
 
 运行时行为（模式、跟踪、窗口、计划）一律走面板 → `/policy`，不进 entry config。
 
+## 新增管理与诊断能力
+
+- 快照列表展示新快照的载荷体积，可确认删除；安装中及等待重启时用于保护运行版本的快照禁止删除。
+- 新快照记录文件路径、大小及符号链接目标，恢复前检查，缺失/大小变化会拒绝恢复。不是内容哈希校验；旧快照标记为仅元数据校验，体积可能未知。
+- 面板“检查”使用 `POST /check/run`，按当前跟踪策略更新检查记录；即使开启自动更新，手动检查也不会直接安装或新增等待任务。
+- 重启诊断卡按需读取状态目录的 `restart.log`，最多返回末尾 16 KiB / 100 行，过滤常见凭据格式。日志可能包含本机路径，分享前仍须检查。
+- npm CLI 缺失和 EACCES/EPERM 权限失败会给出终端、全局前缀、缓存权限或文件锁排查建议；不会自动提权。
+- 新接口：`POST /snapshots/delete`（`{version}`）、`POST /check/run`、`GET /restart/diagnostics`，均位于 `/api/dsh-version-update` 且沿用本机访问限制。
+
 ## 开发
 
 ```sh
-npm test          # node:test，83 个用例覆盖协议/域逻辑/路由/组装/浏览器控制器
+npm test          # node:test，覆盖协议/域逻辑/路由/组装/浏览器控制器
 npm run typecheck # tsc --checkJs strict，无构建产物的类型安全
 ```
 

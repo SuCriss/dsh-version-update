@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { appendHistory, defaultHistoryPath, loadHistory, summarizeHistory } from '../lib/history.js'
@@ -70,4 +70,23 @@ test('summarizeHistory returns the newest entries first', () => {
     { at: 3, to: '0.2.0', result: 'ok', restored: true },
   ])
   assert.deepEqual(summary.recent.map(entry => entry.at), [3, 2, 1])
+})
+
+test('an append replaces a torn file atomically and leaves no temp litter', (t) => {
+  const path = tempPath(t)
+  appendHistory(path, { at: 1, to: '0.1.0', result: 'ok' })
+
+  // What a crash mid-write (or an editor) leaves behind: truncated JSON that
+  // loadHistory reads as "no history at all". The next append must REPLACE it
+  // through a temp file plus a rename, never write the live file in place.
+  writeFileSync(path, '{ torn')
+  appendHistory(path, { at: 2, to: '0.2.0', result: 'ok' })
+
+  // The torn entry is gone (it never parsed) and the new entry stands.
+  assert.deepEqual(loadHistory(path), [{ at: 2, to: '0.2.0', result: 'ok' }])
+  assert.deepEqual(
+    readdirSync(join(path, '..')),
+    ['history.json'],
+    'a temp write must not survive its own rename',
+  )
 })
