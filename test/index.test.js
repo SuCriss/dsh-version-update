@@ -5,13 +5,14 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { VERSION_API, DEFAULT_POLICY } from '../lib/protocol.js'
+import { createSnapshotAsync } from '../lib/snapshot.js'
 import { apply } from '../lib/index.js'
-import { createSnapshot } from '../lib/snapshot.js'
 
 /**
  * A fake cordis context recording route registrations and effects. `register`
@@ -84,41 +85,6 @@ async function invoke(routes, path, opts = {}) {
   return res
 }
 
-test('host wiring lists snapshot bytes, deletes the selected copy and reads its fixed restart log', async (t) => {
-  const { installDir, dataDir } = environment(t)
-  const snapshotsDir = join(dataDir, 'snapshots')
-  assert.equal(createSnapshot({ installDir, snapshotsDir, version: '0.4.0' }).ok, true)
-  const ctx = fakeCtx()
-  apply(ctx, { dataDir })
-  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
-  const listed = await invoke(ctx.registered, VERSION_API.snapshots)
-  assert.ok(listed.body.result.snapshots[0].bytes > 0)
-  const deleted = await invoke(ctx.registered, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.4.0' } })
-  assert.equal(deleted.status, 200)
-  assert.deepEqual(deleted.body.result.snapshots, [])
-  assert.equal(existsSync(join(snapshotsDir, '0.4.0')), false)
-  writeFileSync(join(dataDir, 'restart.log'), 'handoff ready\n')
-  const log = await invoke(ctx.registered, VERSION_API.restartDiagnostics)
-  assert.equal(log.body.result.log, 'handoff ready\n')
-})
-
-test('host manual-check wiring updates lastCheck under auto policy without starting npm', async (t) => {
-  const { dataDir } = environment(t)
-  const oldFetch = globalThis.fetch
-  t.after(() => { globalThis.fetch = oldFetch })
-  globalThis.fetch = async () => ({ ok: true, json: async () => ({
-    'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {} },
-  }) })
-  const ctx = fakeCtx()
-  apply(ctx, { dataDir })
-  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
-  await invoke(ctx.registered, VERSION_API.policy, { method: 'POST', body: { mode: 'auto' } })
-  const checked = await invoke(ctx.registered, VERSION_API.checkRun, { method: 'POST' })
-  assert.equal(checked.body.result.lastCheck.target, '0.5.0')
-  assert.equal(checked.body.result.task.state, 'idle')
-  assert.equal(checked.body.result.pendingAuto, undefined)
-})
-
 test('apply mounts the full core family; notes stay off without a repo slug', (t) => {
   const { dataDir } = environment(t)
   const ctx = fakeCtx()
@@ -126,17 +92,15 @@ test('apply mounts the full core family; notes stay off without a repo slug', (t
   const paths = ctx.registered.map(route => route.path).sort()
   assert.deepEqual(paths, [
     VERSION_API.check,
-    VERSION_API.checkRun,
-    VERSION_API.snapshotDelete,
-    VERSION_API.restartDiagnostics,
     VERSION_API.policy,
     VERSION_API.restart,
     VERSION_API.restartCancel,
     VERSION_API.restore,
+    VERSION_API.snapshotDelete,
     VERSION_API.snapshots,
     VERSION_API.status,
     VERSION_API.update,
-  ].sort(), 'notes requires a GitHub repo; this fake manifest has none')
+  ].sort(), 'the family is exactly these routes; /notes stays absent without a repo slug')
   assert.equal(new Set(paths).size, paths.length, 'the web server keys routes by path: no family may mount one twice')
 })
 
@@ -191,7 +155,7 @@ test('status reports the running version from the discovered installation', asyn
 test('snapshots start empty and restore reports a missing snapshot as conflict', async (t) => {
   const { dataDir } = environment(t)
   const ctx = fakeCtx()
-  apply(ctx, { dataDir })
+  apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
 
   const listed = await invoke(ctx.registered, VERSION_API.snapshots)
   assert.deepEqual(listed.body.result.snapshots, [])
@@ -201,6 +165,31 @@ test('snapshots start empty and restore reports a missing snapshot as conflict',
     body: { version: '9.9.9' },
   })
   assert.equal(failed.status, 409)
+  // The reason matters: a 409 from lock contention would pass the status check
+  // while proving nothing about the snapshot store.
+  assert.match(failed.body.error, /no usable snapshot of 9\.9\.9/)
+})
+
+test('a panel check feeds the scheduler, so the auto decision runs without any daily timer', async (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+  // notify: the decision records its finding but never installs — the wiring
+  // is proven without letting the composition spawn a real npm install.
+  await invoke(ctx.registered, VERSION_API.policy, { method: 'POST', body: { mode: 'notify' } })
+  const savedFetch = globalThis.fetch
+  globalThis.fetch = /** @type {any} */ (async () => ({
+    ok: true,
+    json: async () => ({ 'dist-tags': { latest: '9.9.9' }, versions: { '9.9.9': {}, '0.4.0': {} } }),
+  }))
+  try {
+    const res = await invoke(ctx.registered, VERSION_API.check)
+    assert.equal(res.status, 200)
+    assert.equal(res.body.result.lastCheck.updateAvailable, true, 'the panel check reached the scheduler')
+    assert.equal(res.body.result.lastCheck.target, '9.9.9')
+  } finally {
+    globalThis.fetch = savedFetch
+  }
 })
 
 test('disposal unregisters every route and stops the scheduler', (t) => {
@@ -210,4 +199,143 @@ test('disposal unregisters every route and stops the scheduler', (t) => {
   assert.ok(ctx.registered.length > 0)
   for (const dispose of [...ctx.effects]) dispose?.()
   assert.equal(ctx.registered.length, 0, 'the routes effect removed every registration')
+})
+
+test('an unusable registry config degrades and reports, instead of failing the mount', async (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  const messages = []
+  const savedError = console.error
+  console.error = (...args) => { messages.push(args.join(' ')) }
+  try {
+    apply(ctx, { dataDir, registry: 'not a url at all' })
+  } finally {
+    console.error = savedError
+  }
+  // Before: the throw escaped apply(), so one typo in one setting took the
+  // whole route family with it and the panel reported "host routes not
+  // mounted" — sending the user to restart a host that was fine.
+  assert.ok(ctx.registered.length > 0, 'the routes still mount')
+  assert.ok(messages.some(line => line.includes('invalid registry')), 'the degradation is reported, not silent')
+  const res = await invoke(ctx.registered, VERSION_API.status)
+  assert.equal(res.status, 200)
+})
+
+test('an unwritable state directory costs persistence, not the mount', async (t) => {
+  environment(t)
+  // A regular file where the state directory should be: every write under it
+  // fails with ENOTDIR, including the first-mount policy seeding.
+  const blocker = join(tmpdir(), `vu-blocker-${String(Date.now())}`)
+  writeFileSync(blocker, 'not a directory')
+  t.after(() => rmSync(blocker, { force: true }))
+  const ctx = fakeCtx()
+  const savedError = console.error
+  const messages = []
+  console.error = (...args) => { messages.push(args.join(' ')) }
+  try {
+    apply(ctx, { dataDir: join(blocker, 'state') })
+  } finally {
+    console.error = savedError
+  }
+  assert.ok(ctx.registered.length > 0, 'the plugin still serves its routes')
+  const res = await invoke(ctx.registered, VERSION_API.policy)
+  assert.equal(res.status, 200, 'the policy is still readable from memory')
+  assert.ok(messages.some(line => line.includes('cannot write')), 'the failed seed is reported')
+})
+
+test('a restore goes through the snapshot store and back to the recorded version', async (t) => {
+  const { installDir, dataDir } = environment(t)
+  const snapshotsDir = join(dataDir, 'snapshots')
+  const made = await createSnapshotAsync({ installDir, snapshotsDir, version: '0.4.0', now: () => 1000 })
+  assert.deepEqual(made, { ok: true })
+  // An "update" moved the live tree forward.
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.9.0' }))
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
+  const res = await invoke(ctx.registered, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body.result.restored, '0.4.0')
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.4.0')
+  // The rollback is in the audit trail, marked as a restore.
+  const history = JSON.parse(readFileSync(join(dataDir, 'history.json'), 'utf8'))
+  assert.equal(history.at(-1).restored, true)
+  assert.equal(history.at(-1).to, '0.4.0')
+})
+
+test('a snapshot delete unlinks that version, leaves the tree alone, and writes no history', async (t) => {
+  const { installDir, dataDir } = environment(t)
+  const snapshotsDir = join(dataDir, 'snapshots')
+  assert.deepEqual(await createSnapshotAsync({ installDir, snapshotsDir, version: '0.4.0', now: () => 1000 }), { ok: true })
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
+  const res = await invoke(ctx.registered, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(existsSync(join(snapshotsDir, '0.4.0')), false, 'that snapshot is gone from disk')
+  assert.deepEqual(res.body.result.snapshots, [], 'and it is gone from the list the route returned')
+  // The live tree is not what this operation touches, so it must survive
+  // byte-for-byte: a deleted backup that also cost the installation is worse
+  // than no delete at all.
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.4.0')
+  // A discarded backup is not a transition of the installed version. The audit
+  // trail answers "what was this machine running, and when"; writing a record per
+  // deletion would read as a restore that never happened.
+  const historyPath = join(dataDir, 'history.json')
+  const entries = existsSync(historyPath) ? JSON.parse(readFileSync(historyPath, 'utf8')) : []
+  assert.deepEqual(entries, [])
+
+  // The same delete again is a conflict, not a silent success: the caller asked
+  // for something that is no longer there to remove.
+  const again = await invoke(ctx.registered, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(again.status, 409)
+  assert.match(String(again.body.error), /no snapshot of 0\.4\.0/)
+})
+
+test('the panel sees a trail another host rewrote without changing its size', async (t) => {
+  const { dataDir } = environment(t)
+  const historyPath = join(dataDir, 'history.json')
+  // appendHistory's own wire format, so a second entry of the same width is the
+  // same number of bytes: the trail is capped and rewritten whole, which is
+  // exactly how a size-only cache key goes stale.
+  const entry = to => `${JSON.stringify([{ at: 1, to, result: 'ok' }], null, 1)}\n`
+  writeFileSync(historyPath, entry('0.3.0'), 'utf8')
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+
+  const first = await invoke(ctx.registered, VERSION_API.status)
+  assert.deepEqual(first.body.result.recent.map(item => item.to), ['0.3.0'])
+
+  writeFileSync(historyPath, entry('0.3.1'), 'utf8')
+  assert.equal(readFileSync(historyPath, 'utf8').length, entry('0.3.0').length, 'the rewrite preserved the size')
+  // A filesystem that resolves writes coarsely could report the same mtime for
+  // both; setting it explicitly is what makes this a test of the key rather than
+  // of how fast this machine happens to be.
+  utimesSync(historyPath, new Date(2000), new Date(2000))
+
+  const second = await invoke(ctx.registered, VERSION_API.status)
+  assert.deepEqual(second.body.result.recent.map(item => item.to), ['0.3.1'], 'the moved stamp was enough to re-read')
+})
+
+test('a restore yields to another host that holds the machine-wide lock', async (t) => {
+  const { installDir, dataDir } = environment(t)
+  const snapshotsDir = join(dataDir, 'snapshots')
+  assert.deepEqual(await createSnapshotAsync({ installDir, snapshotsDir, version: '0.4.0', now: () => 1 }), { ok: true })
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.9.0' }))
+
+  // A live process that is NOT this one: the staleness rules must honor it, so
+  // the composition has to refuse to swap the tree underneath it.
+  const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' })
+  t.after(() => { other.kill() })
+  const lockPath = join(dataDir, 'update.lock')
+  writeFileSync(lockPath, JSON.stringify({ pid: other.pid, at: Date.now(), token: 'foreign' }), 'utf8')
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath })
+  const res = await invoke(ctx.registered, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 409)
+  assert.match(res.body.error, /machine-wide update lock/)
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.9.0', 'the other host\'s tree is untouched')
+  // The refusal left the foreign lock exactly where it was.
+  assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).token, 'foreign')
 })

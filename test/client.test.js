@@ -17,7 +17,7 @@ import { test } from 'node:test'
  * Load lib/client.js under a fake module loader and browser globals.
  * @returns {Promise<{ createController: Function; compareVersionTexts: Function; isDowngrade: Function; dictionaries: Record<string, Record<string, string>> }>} the module exports.
  */
-async function loadClient() {
+async function loadClient(reactImpl) {
   let captured
   globalThis.window = {
     __ModuleLoader__: { load: (options) => { captured = options.factory } },
@@ -25,7 +25,7 @@ async function loadClient() {
     location: { reload: () => {} },
     matchMedia: () => ({ matches: false }),
   }
-  const react = {
+  const react = reactImpl ?? {
     createElement: (type, props, ...children) => ({ type, props, children }),
     useRef: initial => ({ current: initial }),
     useState: initial => [initial, () => {}],
@@ -69,21 +69,35 @@ function fakeOverlay() {
 
 /**
  * Install a fetch stub answering per path suffix.
- * @param {Record<string, (call: number) => object>} table - suffix → response factory.
+ *
+ * Method matters to this stub's callers: several routes are POST-only, so a
+ * handler that calls them without a body gets a 405 the browser half would
+ * never notice. Every call is therefore recorded with its method (and the
+ * parsed body) on `calls`, which is what the restart-deferral tests assert on.
+ * @param {Record<string, (call: number, meta: { method: string }) => object>} table - suffix → response factory.
  */
 function fakeFetch(table) {
   const counts = {}
+  /** @type {{ path: string; method: string; body: unknown }[]} */
+  const calls = []
   let phase = table
-  const impl = async (path) => {
+  const impl = async (path, init) => {
+    const method = typeof init?.method === 'string' ? init.method : 'GET'
+    calls.push({ path, method, body: init?.body })
     const key = Object.keys(phase).find(suffix => path.endsWith(suffix))
     if (key === undefined) throw new Error(`unexpected fetch: ${path}`)
     counts[key] = (counts[key] ?? 0) + 1
-    return phase[key](counts[key])
+    return phase[key](counts[key], { method })
   }
   return {
     /** Swap the answer table mid-test (e.g. once the host "restarted"). */
     setTable(next) { phase = next },
     counts,
+    calls,
+    /** How many times one method was used against one path suffix. */
+    hit(method, suffix) {
+      return calls.filter(call => call.method === method && call.path.endsWith(suffix)).length
+    },
     install() {
       globalThis.fetch = impl
       return impl
@@ -117,6 +131,131 @@ const t = key => key
 async function flush(turns = 12) {
   for (let index = 0; index < turns; index += 1) await Promise.resolve()
 }
+
+/**
+ * A React stand-in with real hook semantics for ONE component, so a render can
+ * be driven by hand. State persists across the renders this harness performs and
+ * `useEffect` re-runs exactly when its dependency array changes by identity —
+ * which is the mechanism an unsaved form edit lives or dies by.
+ */
+function fakeHooks() {
+  /** @type {{ has: boolean; value: unknown; deps: unknown[] | undefined }[]} */
+  const slots = []
+  let cursor = 0
+  /** Claim the next hook slot, in call order. */
+  const next = () => {
+    const at = cursor
+    cursor += 1
+    if (slots[at] === undefined) slots[at] = { has: false, value: undefined, deps: undefined }
+    return slots[at]
+  }
+  const depsChanged = (before, after) => before === undefined
+    || after === undefined
+    || before.length !== after.length
+    || before.some((item, index) => !Object.is(item, after[index]))
+  /** Set when a state write happened during a render, so it needs another. */
+  let dirty = false
+  return {
+    react: {
+      createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+      useRef: (initial) => {
+        const slot = next()
+        if (!slot.has) { slot.has = true; slot.value = { current: initial } }
+        return slot.value
+      },
+      useState: (initial) => {
+        const slot = next()
+        if (!slot.has) { slot.has = true; slot.value = typeof initial === 'function' ? initial() : initial }
+        return [slot.value, (update) => {
+          dirty = true
+          slot.value = typeof update === 'function' ? update(slot.value) : update
+        }]
+      },
+      useEffect: (fn, deps) => {
+        const slot = next()
+        if (depsChanged(slot.deps, deps)) { slot.deps = deps; fn() }
+      },
+    },
+    /** Render the component until it settles, and return that tree. */
+    render(component, props) {
+      let tree = undefined
+      for (let pass = 0; pass < 4; pass += 1) {
+        cursor = 0
+        dirty = false
+        tree = component(props)
+        if (!dirty) break
+      }
+      return tree
+    },
+  }
+}
+
+/**
+ * Depth-first search over a rendered tree, descending into prop values as well
+ * as children: this panel hands controls to fields through `control` props, so a
+ * children-only walk would miss every input in the form.
+ * @param {unknown} node - the node to search from.
+ * @param {(node: any) => boolean} predicate - what counts as a hit.
+ * @param {Set<object>} [seen] - cycle guard.
+ * @returns {any} the first matching node, or undefined.
+ */
+function findNode(node, predicate, seen = new Set()) {
+  if (typeof node !== 'object' || node === null || seen.has(node)) return undefined
+  seen.add(node)
+  if (predicate(node)) return node
+  const children = Array.isArray(node.children) ? node.children.flat() : []
+  const queue = [...children, ...Object.values(node.props ?? {})]
+  for (const child of queue) {
+    const hit = findNode(child, predicate, seen)
+    if (hit !== undefined) return hit
+  }
+  return undefined
+}
+
+test('the policy form keeps an unsaved edit, shows the derived hint, and resets on a real answer', async () => {
+  const hooks = fakeHooks()
+  const client = await loadClient(hooks.react)
+  assert.equal(typeof client.PolicyCard, 'function', 'the form is reachable for this test')
+  // The policy object the panel passes is the controller's own state object, so
+  // it keeps its identity across renders and changes only when the host answers.
+  const policy = { mode: 'off', track: { kind: 'tag', tag: 'latest' }, window: null, restart: 'ask', checkAt: null }
+  const props = {
+    t, policy, nextCheckHint: undefined, saving: false, error: undefined, notice: undefined,
+    onSave: () => {}, onRefresh: () => {},
+  }
+  /** The first dropdown of the form, which is the mode selector. */
+  const modeSelect = (tree) => {
+    const node = findNode(tree, candidate => candidate?.props?.options !== undefined)
+    assert.ok(node !== undefined, 'a dropdown was rendered')
+    return node.props
+  }
+  /** The next-check hint text, or undefined when the form shows none. */
+  const hint = (tree) => {
+    const node = findNode(tree, candidate => candidate?.props?.className === 'dshvu_hint')
+    return node === undefined ? undefined : node.children[0]
+  }
+
+  let tree = hooks.render(client.PolicyCard, props)
+  assert.equal(modeSelect(tree).value, 'off')
+
+  // An edit, then a re-render that changed nothing about the policy (a poll
+  // landed, another card repainted): a half-typed form is the user's work, and no
+  // unrelated render may throw it away.
+  modeSelect(tree).onChange('auto')
+  tree = hooks.render(client.PolicyCard, props)
+  assert.equal(modeSelect(tree).value, 'auto', 'an unsaved edit survived an unrelated render')
+
+  // The schedule hint updates on that same stable policy object. It used to
+  // travel INSIDE the policy, which is exactly why the form had to be re-fed a
+  // fresh object every render — and why every render cost the user their edit.
+  tree = hooks.render(client.PolicyCard, { ...props, nextCheckHint: 'next: 04:00' })
+  assert.equal(hint(tree), 'next: 04:00', 'the derived hint is not held hostage by the draft')
+  assert.equal(modeSelect(tree).value, 'auto', 'and showing it did not cost the edit')
+
+  // A genuine host answer (a save, or a refresh) replaces the draft, as designed.
+  tree = hooks.render(client.PolicyCard, { ...props, policy: { ...policy, mode: 'notify' } })
+  assert.equal(modeSelect(tree).value, 'notify', 'a real policy change wins over the draft')
+})
 
 /**
  * Every key the panel asks for must resolve. The host locale runtime looks a
@@ -173,6 +312,31 @@ test('the browser version ranking mirrors the host grammar', async () => {
   assert.equal(client.isDowngrade('latest', '0.4.0'), false)
 })
 
+test('the verdict never claims "up to date" for a registry it could not read', async () => {
+  const client = await loadClient()
+  const verdict = client.installVerdict
+  // The healthy cases.
+  assert.equal(verdict(t, { status: 'ready', installed: '0.4.0', channels: [] }, []), t('upToDate'))
+  assert.equal(
+    verdict(t, { status: 'ready', installed: '0.4.0' }, [{ version: '0.5.0' }]),
+    t('available', { version: '0.5.0' }),
+  )
+  // The one that used to lie: a degraded check answers with NO channels at all
+  // plus a publishedError, and an empty `ahead` proved nothing about what is
+  // published — the panel stated the single thing the data could not support.
+  assert.equal(
+    verdict(t, { status: 'ready', installed: '0.4.0', publishedError: 'fetch failed' }, []),
+    t('publishUnknown'),
+  )
+  // Nothing to say before the first read answers, or without a known version.
+  assert.equal(verdict(t, { status: 'loading' }, []), undefined)
+  assert.equal(verdict(t, { status: 'ready' }, []), undefined)
+  // Both dictionaries must carry the key the branch renders.
+  for (const lang of ['zh', 'en']) {
+    assert.ok(client.dictionaries[lang].publishUnknown, `${lang} names the unknown verdict`)
+  }
+})
+
 test('check merges local facts, registry view, and snapshots', async () => {
   const client = await loadClient()
   fakeFetch({
@@ -207,136 +371,10 @@ test('an HTML fallback is diagnosed as not-mounted instead of HTTP 200', async (
   assert.equal(controller.getSnapshot().error, 'notMounted')
 })
 
-test('the local view renders the moment /status answers, before the slow registry read', async () => {
-  const client = await loadClient()
-  // The registry read is stalled deliberately; /status answers at once. The
-  // panel shows the installed version and the history without waiting for the
-  // network — what an offline machine would otherwise stare at for ~30 s.
-  let release
-  const gate = new Promise(resolve => { release = resolve })
-  fakeFetch({
-    '/status': () => json({ result: {
-      state: 'idle', log: '',
-      running: '0.4.0', installed: '0.4.0', stale: false, needsRestart: false,
-      lastCheck: { at: 42 }, recent: [{ at: 1, to: '0.4.0', result: 'ok' }],
-    } }),
-    '/check': async () => {
-      await gate
-      return json({ result: {
-        installed: '0.4.0', installDir: '/i',
-        channels: [{ channel: 'latest', version: '0.5.0', ahead: true }],
-        versions: ['0.5.0', '0.4.0'],
-        task: { state: 'idle', log: '' },
-        lastCheck: { at: 42 }, recent: [{ at: 1, to: '0.4.0', result: 'ok' }],
-      } })
-    },
-    '/snapshots': () => json({ result: { snapshots: [] } }),
-  }).install()
-  const controller = client.createController({ t })
-  const checking = controller.check()
-  await flush()
-  const early = controller.getSnapshot()
-  assert.equal(early.installed, '0.4.0', 'the installed version is visible before the registry answers')
-  assert.equal(early.history.length, 1, 'the recent activity is visible too')
-  assert.equal(early.status, 'loading', 'the registry read is still in flight')
-
-  release()
-  await checking
-  const settled = controller.getSnapshot()
-  assert.equal(settled.status, 'ready')
-  assert.equal(settled.channels[0].version, '0.5.0', 'the registry view arrives when it arrives')
-})
-
-test('a failing /status during the load is silent; /check reports the failure', async () => {
-  const client = await loadClient()
-  let localCalls = 0
-  fakeFetch({
-    '/status': () => { localCalls += 1; return json({ error: 'nope' }, 500) },
-    '/check': () => json({ error: 'registry unreachable' }, 502),
-  }).install()
-  const controller = client.createController({ t })
-  await controller.check()
-  assert.equal(localCalls, 1)
-  const s = controller.getSnapshot()
-  assert.equal(s.status, 'error')
-  assert.equal(s.error, 'registry unreachable', 'the registry failure is the reported one')
-  assert.equal(s.installed, undefined, 'no local fact was applied from the failed probe')
-})
-
-test('a running install found by the early /status starts its poll at once', async (ctx) => {
-  const client = await loadClient()
-  let release
-  const gate = new Promise(resolve => { release = resolve })
-  let statusCalls = 0
-  fakeFetch({
-    '/status': () => {
-      statusCalls += 1
-      return json({ result: {
-        state: 'running', version: '9.9.9', log: 'installing',
-        running: '0.4.0', installed: '0.4.0', stale: false, needsRestart: false,
-        recent: [],
-      } })
-    },
-    '/check': async () => {
-      await gate
-      return json({ result: { installed: '0.4.0', task: { state: 'running', version: '9.9.9', log: '' } } })
-    },
-    '/snapshots': () => json({ result: { snapshots: [] } }),
-  }).install()
-  ctx.mock.timers.enable({ apis: ['setTimeout'] })
-  const controller = client.createController({ t })
-  const checking = controller.check()
-  try {
-    await flush()
-    assert.equal(controller.getSnapshot().task.state, 'running', 'the running task is visible early')
-    assert.equal(controller.getSnapshot().task.needsRestart, false)
-    const firstPolls = statusCalls
-    ctx.mock.timers.tick(800)
-    await flush()
-    assert.equal(statusCalls, firstPolls + 1, 'polling does not wait for /check')
-  } finally {
-    release()
-    await checking
-    controller.dispose()
-    ctx.mock.timers.reset()
-  }
-})
-
-test('snapshot deletion requires confirmation and diagnostics load on demand', async (ctx) => {
-  const client = await loadClient()
-  const requests = []
-  const oldFetch = globalThis.fetch
-  ctx.after(() => { globalThis.fetch = oldFetch })
-  globalThis.fetch = async (path, options) => {
-    requests.push({ path, options })
-    if (path.endsWith('/snapshots/delete')) return json({ result: { deleted: '1.0.0', snapshots: [] } })
-    return json({ result: { available: true, log: 'ready', truncated: false } })
-  }
-  const controller = client.createController({ t })
-  ctx.after(() => controller.dispose())
-  controller.requestDeleteSnapshot('1.0.0')
-  assert.equal(requests.length, 0)
-  controller.cancelDeleteSnapshot()
-  await controller.confirmDeleteSnapshot()
-  assert.equal(requests.length, 0)
-  controller.requestDeleteSnapshot('1.0.0')
-  await controller.confirmDeleteSnapshot()
-  assert.equal(requests[0].options.method, 'POST')
-  assert.deepEqual(JSON.parse(requests[0].options.body), { version: '1.0.0' })
-  assert.equal(controller.getSnapshot().deleteConfirm, undefined)
-  assert.equal(controller.getSnapshot().busy, false)
-  await controller.loadRestartDiagnostics()
-  assert.equal(controller.getSnapshot().diagnostics.log, 'ready')
-  globalThis.fetch = async () => json({ error: 'denied' }, 409)
-  controller.requestDeleteSnapshot('1.0.0')
-  await controller.confirmDeleteSnapshot()
-  assert.equal(controller.getSnapshot().snapshotError, 'denied')
-})
-
 test('check with prompt offers an ahead update for confirmation', async () => {
   const client = await loadClient()
   fakeFetch({
-    '/check/run': () => json({ result: {
+    '/check': () => json({ result: {
       installed: '0.4.0',
       installDir: '/i',
       channels: [{ channel: 'latest', version: '0.5.0', ahead: true }],
@@ -397,14 +435,16 @@ test('a rejected policy patch surfaces the host reason', async () => {
 test('a stale host discovered at page load offers a restart without arming one', async () => {
   const client = await loadClient()
   const overlay = fakeOverlay()
-  fakeFetch({
+  const fetch = fakeFetch({
     '/status': () => json({ result: {
       state: 'idle', log: '',
       running: '0.4.0', installed: '0.9.0', stale: true, needsRestart: true,
       restartable: true,
     } }),
     '/policy': () => json({ result: { policy: {} } }),
-  }).install()
+    '/cancel': () => json({ result: { cancelled: true } }),
+  })
+  fetch.install()
   const controller = client.createController({ t, overlay })
   controller.resume()
   await flush()
@@ -413,9 +453,14 @@ test('a stale host discovered at page load offers a restart without arming one',
   const view = overlay.last()
   assert.equal(view.title, t('restart.title'))
   assert.ok(view.actions.some(a => a.label === t('restart.now')))
-  // Offered, not forced: "later" leaves the page alone.
+  // Offered, not forced: "later" leaves the page alone — but the word carries
+  // the same promise in both dialogs, so it must also disarm a pending
+  // host-side fallback restart, through the POST-only cancel route.
   overlay.click(t('restart.later'))
+  await flush()
   assert.equal(overlay.hidden, 1)
+  assert.equal(fetch.hit('POST', '/restart/cancel'), 1, 'deferring the offer disarms the fallback')
+  assert.equal(fetch.hit('POST', '/restart'), 0, 'deferring must not restart anything')
 })
 
 test('the watchdog survives a reload through sessionStorage and reloads when ready', async (ctx) => {
@@ -453,7 +498,7 @@ test('install settles into a cancellable countdown; restart reloads when ready',
     let reloaded = 0
     let installPhase = 'running'
     let replacementReady = false
-    fakeFetch({
+    const fetch = fakeFetch({
       '/update': () => json({ result: { state: 'running', version: '9.9.9', log: '' } }),
       '/status': () => json({ result: replacementReady
         ? { state: 'idle', log: '', stale: false, needsRestart: false }
@@ -466,7 +511,8 @@ test('install settles into a cancellable countdown; restart reloads when ready',
           } }),
       '/restart': () => json({ result: {} }),
       '/cancel': () => json({ result: { cancelled: true } }),
-    }).install()
+    })
+    fetch.install()
     const controller = client.createController({ t, overlay, reload: () => { reloaded += 1 } })
 
     controller.requestUpdate('9.9.9')
@@ -487,8 +533,12 @@ test('install settles into a cancellable countdown; restart reloads when ready',
     assert.ok(overlay.shown.length > 0, 'the countdown overlay appeared')
     assert.ok(overlay.last().actions.some(a => a.label === t('restart.later')))
 
-    // "Later" cancels without restarting anything.
+    // "Later" cancels without restarting anything — and disarms the host-side
+    // fallback, which only happens if the cancel reaches the POST-only route.
     overlay.click(t('restart.later'))
+    await flush()
+    assert.equal(fetch.hit('POST', '/restart/cancel'), 1, 'deferring must POST the cancel route')
+    assert.equal(fetch.hit('GET', '/restart/cancel'), 0, 'a GET would answer 405 and be swallowed')
     assert.equal(controller.getSnapshot().restarting, false)
 
     // The manual path walks the identical watchdog flow to a reload.
@@ -503,6 +553,306 @@ test('install settles into a cancellable countdown; restart reloads when ready',
       null,
     )
     await restarting
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
+/**
+ * The minimum `document` the stylesheet installer touches: creation, one head,
+ * and a querySelector that understands only the selector it was asked to match.
+ */
+function fakeDocument() {
+  /** @type {{ dataset: Record<string, string>, textContent: string, removed: boolean, remove(): void }[]} */
+  const tags = []
+  return {
+    tags,
+    createElement: () => {
+      const tag = { dataset: {}, textContent: '', removed: false }
+      tag.remove = () => { tag.removed = true }
+      return tag
+    },
+    head: { appendChild: (tag) => { tags.push(tag) } },
+    querySelector: (selector) => {
+      const id = /data-plugin-css="([^"]+)"/.exec(String(selector))?.[1]
+      if (id === undefined) return null
+      return tags.find(tag => !tag.removed && tag.dataset.pluginCss === id) ?? null
+    },
+  }
+}
+
+test('the stylesheet is released by the last mounting, not the first', async () => {
+  const client = await loadClient()
+  const doc = fakeDocument()
+  globalThis.document = doc
+  try {
+    // A hot swap usually mounts the new page before disposing the old one, so the
+    // second claim arrives while the tag exists and takes no ownership of it. The
+    // old disposer running first must not cost the survivor its rules.
+    const first = client.installStyles()
+    const second = client.installStyles()
+    assert.equal(doc.tags.length, 1, 'one page, one tag')
+    first()
+    assert.equal(doc.tags[0].removed, false, 'a mounting still holding the sheet keeps it')
+    second()
+    assert.equal(doc.tags[0].removed, true, 'the last claimant releases it')
+
+    // A disposer that runs twice must not under-count the claims...
+    second()
+    assert.equal(doc.tags[0].removed, true)
+    // ...which is what a later mount would otherwise discover by finding itself
+    // styled by nothing: the count has to have reached zero for real.
+    const third = client.installStyles()
+    assert.equal(doc.tags.length, 2, 'a mount after full release inserts again')
+    assert.equal(doc.tags[1].removed, false)
+    third()
+    assert.equal(doc.tags[1].removed, true)
+  } finally {
+    delete globalThis.document
+  }
+})
+
+test('deleting a snapshot takes two clicks on the same row', async () => {
+  const client = await loadClient()
+  const overlay = fakeOverlay()
+  const fetch = fakeFetch({
+    // Insertion order matters to the stub: it matches by suffix, so the more
+    // specific route has to be listed before the shorter one it contains.
+    '/snapshots/delete': () => json({ result: { removed: '0.3.0', snapshots: [{ version: '0.2.0', at: 2 }] } }),
+    '/snapshots': () => json({ result: { snapshots: [{ version: '0.3.0', at: 1 }, { version: '0.2.0', at: 2 }] } }),
+    '/policy': () => json({ result: { policy: DEFAULT_POLICY } }),
+    '/check': () => json({ result: { installed: '0.4.0', channels: [], versions: [] } }),
+  })
+  fetch.install()
+  const controller = client.createController({ t, overlay })
+  await controller.check()
+  assert.deepEqual(controller.getSnapshot().snapshots.map(entry => entry.version), ['0.3.0', '0.2.0'])
+
+  // The first click arms the row and asks the host for nothing: this is the one
+  // path in the panel that permanently destroys data with no undo.
+  await controller.deleteSnapshot('0.3.0')
+  assert.equal(controller.getSnapshot().deleteArmed, '0.3.0')
+  assert.equal(fetch.hit('POST', '/snapshots/delete'), 0, 'arming must not delete')
+
+  // The second click on the same version deletes, and the row leaves the panel
+  // with the list the host sent back rather than a guess of what survived.
+  await controller.deleteSnapshot('0.3.0')
+  assert.equal(fetch.hit('POST', '/snapshots/delete'), 1)
+  assert.equal(controller.getSnapshot().deleteArmed, undefined)
+  assert.deepEqual(controller.getSnapshot().snapshots.map(entry => entry.version), ['0.2.0'])
+
+  // A click on a DIFFERENT row moves the arm rather than firing the first one: a
+  // user who changes their mind mid-list deletes nothing.
+  await controller.deleteSnapshot('0.2.0')
+  assert.equal(controller.getSnapshot().deleteArmed, '0.2.0')
+  assert.equal(fetch.hit('POST', '/snapshots/delete'), 1)
+
+  // And a check drops the arm — the list a row was armed against may not be the
+  // list on screen any more.
+  await controller.check()
+  assert.equal(controller.getSnapshot().deleteArmed, undefined)
+  await controller.deleteSnapshot('0.2.0')
+  assert.equal(fetch.hit('POST', '/snapshots/delete'), 1, 'the stale arm did not fire on its own')
+})
+
+test('tree health reaches the panel on the poll it changes in', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    // What a host reports once an interrupted npm has left the global tree
+    // half-committed: no readable manifest, retired directories still in place.
+    const broken = {
+      installDir: '/prefix/node_modules/@deepseek-ai/dsh',
+      manifestOk: false,
+      leftovers: [{ name: '@deepseek-ai.dsh-abc123', path: '/x', ageMs: 9000 }],
+      healthy: false,
+      removed: 0,
+      at: 5,
+    }
+    let phase = 'running'
+    fakeFetch({
+      '/update': () => json({ result: { state: 'running', version: '9.9.9', log: '' } }),
+      '/status': () => json({ result: phase === 'running'
+        ? { state: 'running', version: '9.9.9', log: 'npm ERR!' }
+        : { state: 'failed', version: '9.9.9', log: '', error: 'npm exited 1', tree: broken } }),
+    }).install()
+    const controller = client.createController({ t, overlay })
+    await controller.startUpdate('9.9.9')
+    assert.equal(controller.getSnapshot().tree, undefined, 'no answer has carried a verdict yet')
+
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.equal(controller.getSnapshot().tree, undefined, 'a running install has nothing to report')
+
+    // The repair that produces this fact runs after a failed install settles, so
+    // the verdict arrives on a status answer — not on the panel's own check, which
+    // may be many minutes stale by then.
+    phase = 'failed'
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.deepEqual(controller.getSnapshot().tree, broken, 'the failure carried its tree health through')
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
+test('a dropped poll keeps following the install instead of ending it', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    let mode = 'running'
+    const fetch = fakeFetch({
+      '/update': () => json({ result: { state: 'running', version: '9.9.9', log: '' } }),
+      '/status': () => {
+        if (mode === 'hiccup') throw new Error('Failed to fetch')
+        return json({ result: { state: 'running', version: '9.9.9', log: 'npm still working' } })
+      },
+    })
+    fetch.install()
+    const controller = client.createController({ t, overlay })
+    await controller.startUpdate('9.9.9')
+
+    mode = 'hiccup'
+    ctx.mock.timers.tick(1000)
+    await flush()
+    let snap = controller.getSnapshot()
+    // One refused request used to stop the follow-up entirely: busy cleared,
+    // the error line blaming the UPDATE for a momentary fetch failure, and the
+    // log — the one thing worth watching mid-install — going dead.
+    assert.equal(snap.busy, true, 'a hiccup does not hand the buttons back')
+    assert.equal(snap.error, undefined, 'a dropped fetch is not the install failing')
+
+    mode = 'running'
+    ctx.mock.timers.tick(1000)
+    await flush()
+    snap = controller.getSnapshot()
+    assert.equal(snap.task.log, 'npm still working', 'polling carried on to the next answer')
+    assert.equal(snap.busy, true)
+
+    // A tolerated miss is also forgotten, not remembered as a pending failure:
+    // two hiccups with a good poll between them must not add up to giving up.
+    mode = 'hiccup'
+    ctx.mock.timers.tick(1000)
+    await flush()
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.equal(controller.getSnapshot().error, undefined, 'two misses in a row are still tolerated')
+    // The third one is the limit, and then it is reported as what it is: the
+    // host stopped answering, not the install failing.
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.equal(controller.getSnapshot().busy, false)
+    assert.equal(controller.getSnapshot().error, 'Failed to fetch')
+    const polls = fetch.calls.filter(call => call.path.endsWith('/status')).length
+    ctx.mock.timers.tick(5000)
+    await flush()
+    assert.equal(fetch.calls.filter(call => call.path.endsWith('/status')).length, polls, 'a stopped follow-up stays stopped')
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
+test('an absent host half is reported at once, not retried into silence', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    fakeFetch({
+      '/update': () => json({ result: { state: 'running', version: '9.9.9', log: '' } }),
+      // The SPA fallback shape: the plugin is installed but its host half never
+      // mounted, which no number of retries will change.
+      '/status': () => htmlFallback(),
+    }).install()
+    const controller = client.createController({ t, overlay })
+    await controller.startUpdate('9.9.9')
+    ctx.mock.timers.tick(1000)
+    await flush()
+    assert.equal(controller.getSnapshot().busy, false, 'the panel does not stay locked on a host that is not there')
+    assert.equal(controller.getSnapshot().error, t('notMounted'), 'the absence is named, not invented')
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
+test('a restart asked for twice is one request to the host', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    let reloaded = 0
+    const fetch = fakeFetch({
+      // The host answers once and then exits; a second POST would be the page
+      // asking a process that is already gone.
+      '/restart': () => json({ result: {} }),
+      '/cancel': () => json({ result: { cancelled: true } }),
+      '/status': () => json({ result: { state: 'done', log: '', stale: true, needsRestart: true, restartable: true } }),
+    })
+    fetch.install()
+    const controller = client.createController({ t, overlay, reload: () => { reloaded += 1 } })
+    const first = controller.restart('9.9.9')
+    const second = controller.restart('9.9.9')
+    await flush()
+    assert.equal(fetch.hit('POST', '/restart'), 1, 'the second intent is dropped, not queued')
+    assert.equal(overlay.last().body, t('restart.waiting'), 'the page is waiting on one handoff')
+    ctx.mock.timers.tick(4000)
+    await flush()
+    assert.equal(reloaded, 0, 'a host that never comes back is not reloaded into')
+    await first
+    void second
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
+test('a restart request that never answered counts as a host already gone', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    const fetch = fakeFetch({
+      // An aborted fetch is what a request timeout looks like: the host may
+      // well have taken the hint and exited, so the page must go on watching
+      // rather than report a failure it cannot distinguish from a real refusal.
+      '/restart': () => { throw new Error('The operation was aborted due to timeout') },
+      '/cancel': () => json({ result: { cancelled: true } }),
+      '/status': () => json({ result: { state: 'done', log: '', stale: true, needsRestart: true, restartable: true } }),
+    })
+    fetch.install()
+    const controller = client.createController({ t, overlay, reload: () => {} })
+    const waiting = controller.restart('9.9.9')
+    await flush()
+    assert.equal(overlay.last().body, t('restart.waiting'), JSON.stringify(overlay.shown))
+    assert.notEqual(overlay.last().body, t('restart.failed'), 'no failure was declared')
+    assert.equal(
+      globalThis.window.sessionStorage.getItem('dsh-version-update:awaiting-restart'),
+      '9.9.9',
+      'the watchdog survives a reload of this page',
+    )
+    void waiting
+  } finally {
+    ctx.mock.timers.reset()
+  }
+})
+
+test('a refused restart is reported as a refusal, not a wait', async (ctx) => {
+  const client = await loadClient()
+  ctx.mock.timers.enable()
+  try {
+    const overlay = fakeOverlay()
+    fakeFetch({
+      '/restart': () => json({ error: 'restart unavailable: the listening address is unknown' }, 409),
+      '/cancel': () => json({ result: { cancelled: true } }),
+      '/status': () => json({ result: { state: 'done', log: '', stale: true, needsRestart: true, restartable: true } }),
+    }).install()
+    const controller = client.createController({ t, overlay })
+    await controller.restart('9.9.9')
+    assert.equal(overlay.last().body, t('restart.failed'))
+    assert.equal(controller.getSnapshot().restarting, false, 'the panel hands the choice back')
+    // The refusal must not leave a marker behind: a reload would then sit in a
+    // watchdog waiting for a restart that was never armed.
+    assert.equal(globalThis.window.sessionStorage.getItem('dsh-version-update:awaiting-restart'), null)
   } finally {
     ctx.mock.timers.reset()
   }
@@ -559,75 +909,5 @@ test('restore confirms, applies, and walks the same restart flow', async (ctx) =
     assert.equal(reloaded, 1, 'the restore walked the full restart chain')
   } finally {
     ctx.mock.timers.reset()
-  }
-})
-
-test('style adoption keeps the new fiber styled when the old one disposes', async (ctx) => {
-  const client = await loadClient()
-  let tag = null
-  const original = Object.getOwnPropertyDescriptor(globalThis, 'document')
-  ctx.after(() => {
-    if (original) Object.defineProperty(globalThis, 'document', original)
-    else delete globalThis.document
-  })
-  globalThis.document = {
-    querySelector: () => tag,
-    createElement: () => ({ dataset: {}, textContent: '', remove() { tag = null } }),
-    head: { appendChild(node) { tag = node } },
-  }
-  const disposeOld = client.installStyles()
-  const originalTag = tag
-  tag.textContent = 'obsolete CSS'
-  const disposeNew = client.installStyles()
-  assert.equal(tag, originalTag, 'the tag is reused')
-  assert.notEqual(tag.textContent, 'obsolete CSS', 'adoption refreshes its CSS')
-  disposeOld()
-  assert.equal(tag, originalTag, 'old disposal cannot remove the adopted tag')
-  disposeNew()
-  assert.equal(tag, null, 'the current owner cleans up')
-})
-
-test('the policy form only resets its draft when a policy VALUE changes', async () => {
-  const client = await loadClient()
-  const saved = {
-    mode: 'auto',
-    track: { kind: 'tag', tag: 'latest' },
-    window: { start: '22:00', end: '06:00' },
-    restart: 'ask',
-    checkAt: '04:00',
-  }
-
-  // The page rebuilds the policy object on every render, adding a display-only
-  // next-check hint. That must read as the SAME policy, or every background
-  // poll would wipe whatever the user has typed half a second after they typed
-  // it — and a running install polls every 800 ms.
-  const rerendered = { ...saved, nextCheckHint: 'next check 04:00' }
-  assert.equal(
-    client.policyDraftKey(rerendered),
-    client.policyDraftKey(saved),
-    'a render-only field must not reset the draft',
-  )
-
-  // Every editable field changing does reset the draft, so the host's value —
-  // possibly edited in another panel or normalized by the host — takes over.
-  const changed = [
-    { ...saved, mode: 'notify' },
-    { ...saved, track: { kind: 'pin' } },
-    { ...saved, track: { kind: 'tag', tag: 'next' } },
-    { ...saved, track: { kind: 'line', range: '^1.0.0' } },
-    { ...saved, track: { kind: 'line', range: '^2.0.0' } },
-    { ...saved, window: null },
-    { ...saved, window: { start: '22:00', end: '07:00' } },
-    { ...saved, window: { start: '23:00', end: '06:00' } },
-    { ...saved, restart: 'auto' },
-    { ...saved, checkAt: null },
-    { ...saved, checkAt: '05:00' },
-  ]
-  for (const candidate of changed) {
-    assert.notEqual(
-      client.policyDraftKey(candidate),
-      client.policyDraftKey(saved),
-      JSON.stringify(candidate),
-    )
   }
 })

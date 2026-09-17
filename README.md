@@ -58,11 +58,11 @@ DeepSeek Harness Web GUI 的「版本更新」设置菜单 —— v1.0 全面重
   - `POST /update` — `{version}` 启动一次安装（trigger 固定记为 manual）
   - `GET /status` — 任务视图（`running`/`stale`/`needsRestart`/`restartable`）+ ambient
   - `POST /restart` — 三步交接重启
-  - `POST /restart/cancel` — 解除宿主侧兜底重启（面板选「稍后」时调用）
+  - `POST /restart/cancel` — 取消已挂起的重启（面板点「稍后」时调用；只接受 POST，GET 返回 405）
   - `GET /notes?version=` — GitHub 发布说明（`releaseNotes` 开启且能解析出仓库时挂载）
   - `GET|POST /policy` — 读取 / 打补丁式修改策略（校验失败的每个字段都会被点名，400 返回）
-  - `GET /snapshots`、`POST /restore` — 快照列表与恢复（安装进行中拒绝恢复）
-- **浏览器半区**（`lib/client.js`，exports `./client`）：字典、设置页（状态卡 / 策略表单 / 版本列表 / 任务日志 / 快照中心 / 活动历史）、导航图标标记、重启 watchdog。
+  - `GET /snapshots`、`POST /restore`、`POST /snapshots/delete` — 快照列表 / 恢复 / 删除单个快照（删除同样走机器锁但不碰安装树，成功时把剩余列表一并带回；面板里同一行点两次才删）；恢复与安装争用同一把机器锁，本机有安装在跑或其他宿主持锁都返回 409
+- **浏览器半区**（`lib/client.js`，exports `./client`）：字典、设置页（状态卡 / 策略表单 / 版本列表 / 任务日志 / 快照中心 / 活动历史 / 安装树健康）、导航图标标记、重启 watchdog。
 - **脱离父进程的重启助手**（`lib/relaunch.js`）：等旧 pid 消失、端口释放后原样拉起新进程；armed recovery 时驻留观察新进程可达性，必要时快照恢复再拉起。
 
 ## 安装
@@ -81,7 +81,7 @@ dsh plugin --profile web add github:SuCriss/dsh-version-update
 
 ## 配置（cordis entry config）
 
-- `registry`（默认 `https://registry.npmjs.org`）— 读取与安装共用的 registry 基地址，必须是绝对 http(s) URL。
+- `registry`（默认 `https://registry.npmjs.org`）— 读取与安装共用的 registry 基地址，必须是绝对 http(s) URL。若该地址在网络层失败，读取会落到内置镜像并记住它：随后的安装按**实际读到版本的那个** registry 执行，不会回去问刚刚超时的地址。
 - `allowRestart`（默认 true）— 关闭则不提供重启路由。
 - `releaseNotes`（默认 true）— 是否读取并展示 GitHub 发布说明。
 - `snapshotKeep`（默认 5，1–10）— 快照保留数量。
@@ -102,8 +102,8 @@ dsh plugin --profile web add github:SuCriss/dsh-version-update
 ## 开发
 
 ```sh
-npm test          # node:test，覆盖协议/域逻辑/路由/组装/浏览器控制器
+npm test          # node:test，152 个用例覆盖协议/域逻辑/路由/组装/浏览器控制器/重启助手
 npm run typecheck # tsc --checkJs strict，无构建产物的类型安全
 ```
 
-测试刻意覆盖了几类容易腐化的契约：浏览器端 semver 镜像与 host 排序的一致性、策略归一化的逐字段回退、快照元数据校验与剪枝顺序、单槽位跨 fiber 重载的排他性、mock 时钟下的倒计时/watchdog 链路。
+测试刻意覆盖了几类容易腐化的契约：浏览器端 semver 镜像与 host 排序的一致性、策略归一化的逐字段回退、快照元数据校验与剪枝顺序、单槽位跨 fiber 重载的排他性、mock 时钟下的倒计时/watchdog 链路、机器锁记录的所有权校验（release 只能删掉自己那条）、泊车中的自动更新必然存在下一次唤醒、重启助手两段等待各自的预算与可拨测的探针地址，以及降级不得伪装成结论（registry 读不到时不许说"已是最新"）。

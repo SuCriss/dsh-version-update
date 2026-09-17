@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { VERSION_API, DEFAULT_POLICY } from '../lib/protocol.js'
+import { DEFAULT_REGISTRY } from '../lib/core.js'
 import { makeRoutes } from '../lib/routes.js'
 
 /** A response double recording one answer. */
@@ -80,41 +81,6 @@ function harness(overrides = {}) {
 /** Every fake installation this file created, reclaimed by the final test. */
 const tempDirs = []
 
-test('snapshot deletion validates input, refuses busy installs and removes only the selected snapshot', async () => {
-  let busy = false
-  const removed = []
-  const { routes } = harness({ deps: {
-    updater: { view: () => ({ state: 'idle', log: '' }), isBusy: () => busy, start: () => ({}) },
-    snapshots: { list: () => [], restore: () => ({ ok: true }), remove: version => { removed.push(version); return true } },
-  } })
-  const request = version => invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', body: { version } })
-  assert.equal((await request('../bad')).status, 400)
-  busy = true
-  assert.equal((await request('0.3.0')).status, 409)
-  assert.deepEqual(removed, [])
-  busy = false
-  assert.equal((await request('0.3.0')).body.result.deleted, '0.3.0')
-  assert.deepEqual(removed, ['0.3.0'])
-  assert.equal((await invoke(routes, VERSION_API.snapshotDelete, { method: 'GET' })).status, 405)
-  assert.equal((await invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', fenced: false })).status, 403)
-})
-
-test('manual check and restart diagnostics use their injected operations', async () => {
-  let checked = 0
-  const { routes, started } = harness({ deps: {
-    manualCheck: async () => { checked += 1; return { distTags: { latest: '0.5.0' }, versions: ['0.5.0'] } },
-    ambient: () => ({ lastCheck: { at: 42, target: '0.5.0' } }),
-    restartDiagnostics: () => ({ available: true, log: 'handoff ready', truncated: false }),
-  } })
-  const response = await invoke(routes, VERSION_API.checkRun, { method: 'POST' })
-  assert.equal(response.body.result.lastCheck.at, 42)
-  assert.equal(checked, 1)
-  assert.deepEqual(started, [])
-  const diagnostic = await invoke(routes, VERSION_API.restartDiagnostics, { query: '?path=ignored' })
-  assert.equal(diagnostic.body.result.log, 'handoff ready')
-  assert.equal((await invoke(routes, VERSION_API.restartDiagnostics, { fenced: false })).status, 403)
-})
-
 test('the full route family registers; optional routes appear only when wired', () => {
   const full = harness({
     deps: {
@@ -122,7 +88,7 @@ test('the full route family registers; optional routes appear only when wired', 
       notes: async () => ({}),
       repoSlug: 'o/r',
       policy: { get: () => DEFAULT_POLICY, set: () => {} },
-      snapshots: { list: () => [], restore: () => ({ ok: true }) },
+      snapshots: { list: () => [], restore: () => ({ ok: true }), remove: () => ({ ok: true }) },
     },
   })
   for (const path of Object.values(VERSION_API)) {
@@ -133,7 +99,7 @@ test('the full route family registers; optional routes appear only when wired', 
   // only notes/policy/snapshots appear when their operations are wired.
   const bare = harness()
   assert.deepEqual(bare.routes.map(r => r.path).sort(), [
-    VERSION_API.check, VERSION_API.checkRun, VERSION_API.restart, VERSION_API.restartCancel, VERSION_API.restartDiagnostics, VERSION_API.status, VERSION_API.update,
+    VERSION_API.check, VERSION_API.restart, VERSION_API.restartCancel, VERSION_API.status, VERSION_API.update,
   ])
 })
 
@@ -168,9 +134,11 @@ test('check returns local facts plus the published view and ambient fields', asy
 })
 
 test('a failing registry read degrades check instead of failing it', async () => {
+  let served
   const { routes } = harness({
     deps: {
       fetchImpl: async () => { throw new Error('EAI_AGAIN') },
+      served: registry => { served = registry },
     },
   })
   const res = await invoke(routes, VERSION_API.check)
@@ -179,10 +147,15 @@ test('a failing registry read degrades check instead of failing it', async () =>
   assert.match(res.body.result.publishedError ?? '', /EAI_AGAIN/)
   assert.equal(res.body.result.channels, undefined)
   assert.equal(res.body.result.installed, '0.4.0')
+  // Nothing answered, so nothing may be remembered as the source of a read: an
+  // install must not inherit a registry from a check that failed.
+  assert.equal(served, undefined)
 })
 
 test('a network-layer registry failure falls back to a mirror and still serves the view', async () => {
   let calls = 0
+  /** The registry the host was told these versions came from. */
+  let served
   const { routes } = harness({
     deps: {
       fetchImpl: async () => {
@@ -193,6 +166,7 @@ test('a network-layer registry failure falls back to a mirror and still serves t
           json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {}, '0.4.0': {} } }),
         }
       },
+      served: registry => { served = registry },
     },
   })
   const res = await invoke(routes, VERSION_API.check)
@@ -200,6 +174,11 @@ test('a network-layer registry failure falls back to a mirror and still serves t
   assert.equal(calls, 2, 'the primary registry and one mirror were both tried')
   assert.equal(res.body.result.publishedError, undefined)
   assert.equal(res.body.result.channels[0].version, '0.5.0')
+  // The install that follows this view asks npm for THIS url, not the configured
+  // one: the configured registry is the one that just proved unreachable, and
+  // re-asking it for 0.5.0 would report the offered update as nonexistent.
+  assert.match(String(served), /^https?:\/\//, 'the fallback source is reported to the host')
+  assert.notEqual(served, DEFAULT_REGISTRY, 'a mirror is not reported as the registry it replaced')
 })
 
 test('a registry that answers with an HTTP error does not fall back', async () => {
@@ -212,6 +191,52 @@ test('a registry that answers with an HTTP error does not fall back', async () =
   assert.equal(res.status, 200)
   assert.equal(res.body.result.publishedError, 'registry read failed: HTTP 500')
   assert.equal(res.body.result.channels, undefined)
+})
+
+test('a successful check hands its registry facts to the auto-update decision', async () => {
+  const considered = []
+  const { routes } = harness({
+    deps: {
+      auto: async (published) => { considered.push(published) },
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {}, '0.4.0': {} } }),
+      }),
+    },
+  })
+  const res = await invoke(routes, VERSION_API.check)
+  assert.equal(res.status, 200)
+  assert.equal(considered.length, 1, 'the check reached the scheduler exactly once')
+  assert.deepEqual(considered[0].distTags, { latest: '0.5.0' })
+  assert.deepEqual(considered[0].versions, ['0.5.0', '0.4.0'])
+})
+
+test('a failed registry read never reaches the auto-update decision', async () => {
+  let calls = 0
+  const { routes } = harness({
+    deps: {
+      auto: async () => { calls += 1 },
+      fetchImpl: async () => { throw new Error('EAI_AGAIN') },
+    },
+  })
+  const res = await invoke(routes, VERSION_API.check)
+  assert.equal(res.status, 200)
+  assert.equal(calls, 0, 'without registry facts there is nothing to decide from')
+})
+
+test('a throwing auto decision cannot fail the panel check', async () => {
+  const { routes } = harness({
+    deps: {
+      auto: async () => { throw new Error('decision exploded') },
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {}, '0.4.0': {} } }),
+      }),
+    },
+  })
+  const res = await invoke(routes, VERSION_API.check)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.installed, '0.4.0')
 })
 
 test('update validates the target and always records manual trigger', async () => {
@@ -369,17 +394,7 @@ test('snapshot center lists and restores through its operations', async () => {
 test('restore refuses while an install is writing the tree', async () => {
   const { routes } = harness({
     deps: {
-      snapshots: { list: () => [], restore: () => ({ ok: true }) },
-    },
-    taskView: () => ({ state: 'running', log: '' }),
-  })
-  const res = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
-  assert.equal(res.status, 409)
-})
-test('restore refuses while an install is writing the tree', async () => {
-  const { routes } = harness({
-    deps: {
-      snapshots: { list: () => [], restore: () => ({ ok: true }) },
+      snapshots: { list: () => [], restore: () => ({ ok: true }), remove: () => ({ ok: true }) },
     },
     taskView: () => ({ state: 'running', log: '' }),
   })
@@ -387,38 +402,105 @@ test('restore refuses while an install is writing the tree', async () => {
   assert.equal(res.status, 409)
 })
 
-test('restore refuses while a runner from another fiber holds the tree', async () => {
-  // A plugin-fiber reload replaces the runner: the replacement's own task reads
-  // `idle` while the previous fiber's npm still reifies. The process-wide probe
-  // is the only way the restore guard can see that.
+test('a snapshot delete reaches its operation once and returns the surviving list', async () => {
+  /** Every version the route asked the composition to discard. */
+  const removed = []
   const { routes } = harness({
     deps: {
-      snapshots: { list: () => [{ version: '0.4.0', usable: true }], restore: () => ({ ok: true }) },
-      updater: {
-        view: () => ({ state: 'idle', log: '' }),
-        isBusy: () => true,
-        start: () => ({ state: 'running', log: '' }),
+      snapshots: {
+        list: () => [{ version: '0.3.0', at: 3 }],
+        restore: () => ({ ok: true }),
+        remove: version => {
+          removed.push(version)
+          return version === '0.4.0' ? { ok: true } : { ok: false, error: `no snapshot of ${version} to delete` }
+        },
       },
     },
   })
-  const res = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
-  assert.equal(res.status, 409)
-  assert.match(res.body.error, /install is in progress/)
-})
-
-test('restore works through a runner that has no process-wide probe', async () => {
-  // Backwards compatibility: a runner exposing only view/start (a test fake, or
-  // an embedder's stand-in) still gets the task-state guard, never a 500.
-  const { routes } = harness({
-    deps: {
-      snapshots: { list: () => [{ version: '0.4.0', usable: true }], restore: () => ({ ok: true }) },
-      updater: {
-        view: () => ({ state: 'idle', log: '' }),
-        start: () => ({ state: 'running', log: '' }),
-      },
-    },
-  })
-  const res = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  const res = await invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.4.0' } })
   assert.equal(res.status, 200)
-  assert.equal(res.body.result.restored, '0.4.0')
+  assert.deepEqual(removed, ['0.4.0'])
+  assert.equal(res.body.result.removed, '0.4.0')
+  // The surviving list rides along: the row the user just deleted has to leave
+  // the panel, and a second round-trip against a busy host is how a stale row
+  // survives next to one that is already gone.
+  assert.deepEqual(res.body.result.snapshots, [{ version: '0.3.0', at: 3 }])
+
+  // A version that is not one exact published version never reaches a filesystem
+  // path at all — same gate the restore route holds.
+  const bad = await invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '../outside' } })
+  assert.equal(bad.status, 400)
+  assert.deepEqual(removed, ['0.4.0'], 'the rejected version was never handed to the operation')
+
+  // Nothing to delete is a conflict, not a success: the panel must not drop a row
+  // it was told to remove and could not.
+  const missing = await invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.9.9' } })
+  assert.equal(missing.status, 409)
+  assert.match(String(missing.body.error), /no snapshot of 0\.9\.9/)
+})
+
+test('a snapshot delete refuses while this host is installing', async () => {
+  let touched = 0
+  const { routes } = harness({
+    deps: {
+      snapshots: {
+        list: () => [],
+        restore: () => ({ ok: true }),
+        remove: () => { touched += 1; return { ok: true } },
+      },
+    },
+    // The snapshot a running install took moments ago is its own way out: the
+    // failure path looks for exactly that directory, so deleting it mid-install
+    // would leave a broken tree with nothing to restore.
+    taskView: () => ({ state: 'running', log: '' }),
+  })
+  const res = await invoke(routes, VERSION_API.snapshotDelete, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 409)
+  assert.equal(touched, 0, 'the refusal happens before anything is unlinked')
+})
+
+test('an async restore is awaited, and a contended lock answers 409 not 500', async () => {
+  let releaseHeld
+  const held = new Promise(resolve => { releaseHeld = resolve })
+  const { routes } = harness({
+    deps: {
+      snapshots: {
+        list: () => [],
+        // The composition's restore is asynchronous: it takes the machine-wide
+        // lock and copies the tree off the event loop. The route must await it —
+        // answering early would tell the panel a rollback happened that has
+        // not, and the reply would carry a stale task view.
+        restore: async (version) => {
+          if (version === '0.4.0') await held
+          return version === '0.4.0'
+            ? { ok: true }
+            : { ok: false, error: 'another host holds the machine-wide update lock (pid 7); try again once it finishes' }
+        },
+      },
+    },
+  })
+  const pending = invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  await new Promise(resolve => setTimeout(resolve, 5))
+  const refused = await invoke(routes, VERSION_API.restore, { method: 'POST', body: { version: '0.0.9' } })
+  releaseHeld?.()
+  const ok = await pending
+  assert.equal(ok.status, 200)
+  assert.equal(ok.body.result.restored, '0.4.0')
+  assert.equal(refused.status, 409, 'a lock contention is the client retrying, not a host failure')
+  assert.match(refused.body.error, /machine-wide update lock/)
+})
+
+test('the restart cancel is a POST-only route, and the panel defers with POST', async () => {
+  let cancelled = 0
+  const { routes } = harness({ deps: { restarter: { restart: () => ({}), cancelPending: () => { cancelled += 1 } } } })
+  // The browser half can only disarm the host fallback through POST: a deferral
+  // that reaches this route as a GET answers 405, is swallowed by the caller's
+  // catch, and the host restarts anyway out from under a page that said later.
+  const wrong = await invoke(routes, VERSION_API.restartCancel, { method: 'GET' })
+  assert.equal(wrong.status, 405)
+  assert.equal(cancelled, 0, 'a refused method must not disarm anything')
+  const right = await invoke(routes, VERSION_API.restartCancel, { method: 'POST' })
+  assert.equal(right.status, 200)
+  assert.deepEqual(right.body.result, { cancelled: true })
+  assert.equal(cancelled, 1)
 })

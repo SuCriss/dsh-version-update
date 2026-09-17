@@ -58,11 +58,11 @@ Three halves in one package:
   - `POST /update` — `{version}` starts one install (trigger always recorded as manual)
   - `GET /status` — task view (`running`/`stale`/`needsRestart`/`restartable`) + ambient
   - `POST /restart` — three-step handoff
-  - `POST /restart/cancel` — disarms the host-side fallback restart (the panel calls it on "later")
+  - `POST /restart/cancel` — disarm a pending restart (what the panel's "Later" calls; POST only, GET answers 405)
   - `GET /notes?version=` — GitHub release notes (mounted when enabled and a repo is known)
   - `GET|POST /policy` — read / patch the policy; every rejected field is named in a 400
-  - `GET /snapshots`, `POST /restore` — list & restore (refused while an install runs)
-- **Browser half** (`lib/client.js`, exports `./client`): dictionaries, the settings page (status / policy form / versions / task log / snapshots / history), nav glyph marker, restart watchdog.
+  - `GET /snapshots`, `POST /restore`, `POST /snapshots/delete` — list, restore, and discard one snapshot; a restore contends for the same machine-wide lock an install holds, so a busy tree in this host or another answers 409. Deleting takes that lock too without ever writing the tree (a failed install looks for exactly that directory), answers with the surviving list, and arms on the first click in the panel to delete on the second.
+- **Browser half** (`lib/client.js`, exports `./client`): dictionaries, the settings page (status / policy form / versions / task log / snapshots / history / installation-tree health), nav glyph marker, restart watchdog.
 - **Detached relaunch helper** (`lib/relaunch.js`): waits for pid exit + port release, starts the replacement verbatim; optionally stays alive to snapshot-recover an unreachable replacement.
 
 ## Install
@@ -81,7 +81,7 @@ Restart `dsh web` once so the host half mounts; until then the panel says so exp
 
 ## Configuration (cordis entry config)
 
-- `registry` (default `https://registry.npmjs.org`) — absolute http(s) URL used for BOTH reads and installs.
+- `registry` (default `https://registry.npmjs.org`) — absolute http(s) URL used for BOTH reads and installs. When that URL fails at the network layer the read falls through to a built-in mirror and the host remembers it: the install then goes to the registry the versions were actually read from, not back to the address that just timed out.
 - `allowRestart` (default true) — false removes the restart route.
 - `releaseNotes` (default true).
 - `snapshotKeep` (default 5, clamped 1–10).
@@ -102,8 +102,8 @@ Runtime behavior (mode, tracking, window, schedule) lives in the policy file edi
 ## Development
 
 ```sh
-npm test          # node:test — protocol/domain/routes/composition/browser controller
+npm test          # node:test — 152 cases across protocol/domain/routes/composition/browser controller/relaunch helper
 npm run typecheck # tsc --checkJs strict — type safety without a build step
 ```
 
-The suite deliberately covers the contracts most likely to rot: agreement between the browser semver mirror and the host ranking, per-field fallback in policy normalization, snapshot metadata validation and prune ordering, process-wide single-slot exclusivity across fiber reloads, and the countdown/watchdog chain under mocked clocks.
+The suite deliberately covers the contracts most likely to rot: agreement between the browser semver mirror and the host ranking, per-field fallback in policy normalization, snapshot metadata validation and prune ordering, process-wide single-slot exclusivity across fiber reloads, the countdown/watchdog chain under mocked clocks, machine-lock ownership (a release may only remove the record it still holds), the invariant that a parked auto update always has a next wake armed, the relaunch helper's two independent budgets and its dialable probe address, and the rule that a degraded read may never be presented as a conclusion.

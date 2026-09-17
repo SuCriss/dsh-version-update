@@ -3,87 +3,323 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
-## [Unreleased]
-
-### Added
-
-- Snapshot deletion with confirmation, install-busy protection and protection
-  for the running version's recovery copy while a restart is pending. New
-  snapshots display their payload size in the panel.
-- Version-2 snapshot inventories record file paths, sizes and symbolic-link
-  targets. Listing and restoration check these against the stored copy; missing
-  or resized files prevent restoration before the live tree is touched.
-  Legacy snapshots remain metadata-validated and are labelled as such; their
-  size may be unknown. This is not a cryptographic content-integrity guarantee.
-- `POST /check/run` records a policy-aware manual check without installing or
-  parking an automatic task. The panel's check button uses this endpoint.
-- On-demand restart diagnostics from a fixed `restart.log` in the plugin state
-  directory, retained across host restarts. Responses are limited to a 16 KiB /
-  100-line tail and redact common credential patterns; review before sharing.
-- npm CLI discovery failures include advice based on observed pnpm/Corepack/
-  npm-exec signals. EACCES/EPERM install failures retain the npm log and show
-  ownership, prefix, cache and file-lock troubleshooting without auto-elevation.
-
-### Performance and reliability
-
-- Show local installed/task/history facts from `/status` while the registry
-  check is pending; running tasks begin polling without waiting for registry
-  metadata. The full `/check` response still supplies the version list.
-- Bound the release-notes cache to 32 entries with LRU eviction and the existing
-  TTL. Cache hits refresh recency without extending the TTL.
-- Transfer ownership of the stylesheet during overlapping fiber reloads and
-  refresh its CSS; disposing the old fiber cannot remove the adopted tag.
-- Return retained retired-directory entries from tree repair, avoiding the
-  extra inspection previously performed by the host after repair.
-- Use the scheduler's injected clock for check and parked-finding timestamps.
+## [1.1.8] - 2026-09-12
 
 ### Fixed
 
-- **A parked auto install can no longer outlive the policy that produced it.**
-  A version found outside the execution window waits for its window; if the user
-  turned automation OFF (or pinned the version) while it waited, the wake-up
-  fired anyway and installed the stale target — behind the back of a policy that
-  no longer wanted it. The parked finding is now re-validated when it wakes: the
-  policy must still say `auto`, and its tracking rule must still resolve to the
-  same version. A cycle that runs while automation is off also drops any finding
-  an earlier policy parked.
-- **A parked auto install is retried instead of stranded.** Two timers were
-  wrong whenever the single install slot was busy at the moment of the attempt:
-  with no execution window configured, the parked finding armed NO wake-up at
-  all and was never retried (only the next daily check or a host restart could
-  revive it); with a window, the retry was armed for the NEXT opening — up to a
-  day away, even though the install could legally run right then. Both now
-  retry after `AUTO_RETRY_MS` (one minute). A window moved while a finding
-  waited also re-arms for the new opening instead of leaving it parked.
-- **The policy form keeps unsaved edits across background refreshes.** The page
-  rebuilds the policy object on every render (it adds a display-only next-check
-  hint), and the form reset its draft whenever that object changed — which a
-  running install does every 800 ms, wiping whatever the user had just typed.
-  The draft now resets only when one of the policy's editable values changes.
-- **The history file is written atomically.** An append wrote the file in
-  place, so a crash mid-write left truncated JSON that the tolerant reader
-  interprets as "no history at all" — losing the whole audit trail. Appends go
-  through a temp file plus a same-directory rename, like the policy store.
-- **A snapshot restore can no longer race an install from another fiber.** The
-  restore route refused only while the runner's own task read `running`; after a
-  plugin-fiber reload, a replacement runner reports `idle` while the previous
-  fiber's npm still reifies the tree. The runner now exposes a process-wide
-  `isBusy()` probe (task, pre-spawn snapshot window, and orphaned npm alike),
-  and the restore guard consults it.
-- **An invalid `mode` no longer normalizes to `mode: undefined`.** Every other
-  policy field group keeps its base value when a submission is rejected; `mode`
-  left the field unset, so a caller that ignored `ok` could persist a policy the
-  scheduler could never act on.
+- **A hot swap could strip the stylesheet from the page that survived it.** The
+  installer checked whether its `<style>` tag already existed and, finding it,
+  handed back a do-nothing disposer. That is right about leaking and wrong about
+  removal: the new mounting usually runs before the old one is disposed, so it took
+  no ownership and the old disposer then removed the rules out from under the
+  instance left alive — an unstyled settings page. Claims are counted now, and only
+  the last one releases the tag; a disposer that runs twice cannot under-count.
+- **The polling routes re-read and re-parsed the whole audit trail every tick.**
+  Those facts ride every answer, and `appendHistory` rewrites the file whole, so a
+  panel poll cost a read plus a JSON.parse every 800 ms in the same process that is
+  pumping npm's output. The summary is now reused while the file's `(mtime, size)`
+  is unchanged, and dropped on this host's own writes — the repair path can record
+  twice in one millisecond, and a capped rewrite can land on the same size.
+
+## [1.1.7] - 2026-09-12
+
+### Added
+
+- **The settings page now says what the host already knew about the installation
+  tree.** Since 1.1.0 the composition has measured the global tree it booted from,
+  repaired it when an interrupted npm left it half-committed, and carried the
+  result in every polling answer — and the browser half ignored it, so a machine
+  whose dsh manifest had vanished while the process kept serving from memory
+  displayed a panel that looked perfectly healthy. A card appears when the tree is
+  unhealthy or was rebuilt at startup, naming the directory it could not read, how
+  many retired folders still occupy disk, and what the repair could not finish. It
+  stays absent otherwise: a card that reports nothing every time is a card the user
+  learns to skip.
+- That verdict is carried through the install poll as well as the panel's own
+  check, because the repair that produces it runs when an install **fails** — the
+  one moment the poll is watching and a stale check cannot cover. A status answer
+  without the field keeps the last verdict rather than erasing it: absence means
+  this host never located a tree, not that the previous one healed.
+
+## [1.1.6] - 2026-09-12
+
+### Added
+
+- **A snapshot can be deleted.** `POST /snapshots/delete` (body `{ version }`),
+  with a row action in the snapshot center. The snapshot store has had
+  `removeSnapshot` since it was written and nothing could reach it, so clearing a
+  backup meant opening the data directory in a file manager and guessing which
+  directory matched which version. Unusable snapshots — the ones marked incomplete
+  after an interrupted copy, restorable by nothing — had no action at all, which is
+  precisely the class of entry worth discarding by hand.
+  - Gated like restore: one exact published version or 400, and 409 while this host
+    is installing, because the snapshot a running install took moments ago is its
+    own way out and the failure path looks for exactly that directory.
+  - Takes the machine-wide lock even though it never writes the live tree, so it
+    cannot cross a restore of the same version mid-copy.
+  - Not an audit-trail event: history records which version this machine ran, and
+    discarding a backup changes none. Recording it would read as a restore.
+  - The success response carries the surviving list, so the deleted row leaves the
+    panel with the answer rather than a guess.
+  - Two clicks on the same row, because there is no undo. Any check drops the arm,
+    so a row armed against a list that has since moved cannot fire at a version the
+    user no longer sees.
 
 ### Changed
 
-- The protocol contract has its own test file (`test/protocol.test.js`), which
-  `npm test` had been listing all along — node's runner silently skips a
-  missing file among several, so the phantom entry never failed a run. Time
-  windows, the daily check time, and policy normalization are now pinned
-  directly instead of only through the store, the routes, and the panel.
+- `npm test` no longer names `test/protocol.test.js`. That file has never existed
+  here — git holds no record of it, not even a deletion — and `node --test` folds a
+  missing path into a list of fourteen real ones without complaint, while naming it
+  alone answers `Could not find`. The protocol layer is covered from policy, routes,
+  and index, so the phantom was removed rather than a file invented to fit the name.
+
+## [1.1.5] - 2026-09-12
+
+### Fixed
+
+- **An update could be refused by the registry that had just served it.**
+  `fetchPublished` tries the configured registry and, when that URL fails at the
+  network layer, falls through to a mirror — and reports which one answered. Both
+  readers threw that fact away, so the install passed npm the *configured* URL:
+  on a machine whose registry is unreachable but mirrored, the panel offered a
+  version it had read from the mirror and npm was then asked for it at the address
+  that had just timed out, reporting the update as nonexistent. The answering
+  registry is now remembered by the host (from both read sites) and read at spawn
+  time, so the install goes where the versions came from. Only a registry the host
+  itself read can ever be stored, so no request input can steer an npm argument.
+- **Any unrelated repaint discarded a half-typed policy form.** The panel built
+  the policy prop as a fresh object per render — the derived "next check" hint
+  travelled inside it — while the form's reset effect keys on that object's
+  identity. A poll landing, a notice timer, or another card's interaction therefore
+  replaced whatever the user was mid-way through editing, with nothing changed on
+  the host to justify it. The hint is its own prop now and the policy prop is the
+  controller's own state object, which changes identity precisely when the host
+  answers with a different policy: the one case the effect was meant to see.
+
+### Tests
+
+The suite reaches 145 cases, including a hooks-accurate React stand-in that drives
+`PolicyCard` render by render — the draft's survival lives in the interaction
+between a state slot and an effect dependency list, and is invisible from the
+controller.
+
+## [1.1.4] - 2026-09-12
+
+### Fixed
+
+- **A parked silent update could miss its window and then never wake again.** The
+  window timer fired 50 ms BEFORE the opening it was waiting for, and the wake
+  re-checked the window against the wall clock in whole minutes — at
+  `03:59:59.950` the minute is still 239, so the wake declined the very window it
+  existed for and armed nothing further. With a daily `checkAt` the finding was
+  retried the next day; without one, it was simply gone. The wake now fires just
+  after the boundary, and every way out of it leaves a wake armed: a window that
+  moved while the timer sat armed waits for the next opening, and a slot still
+  busy (a manual install, or another host holding the machine-wide lock) comes
+  back in a minute instead of a day. That busy case with **no** window configured
+  was worse — arming a wake for a window that does not exist arms nothing at all.
+- **A slow host exit could eat the restart handoff.** The detached helper waits
+  for two things in sequence — the old process gone, then the port it held
+  released — and both waits shared one deadline. A host that spent most of the
+  budget dying left the port wait whatever remained, and when that ran out the
+  helper gave up on a handoff that was about to succeed: no replacement at all,
+  and the machine stays down until someone starts it by hand. Each wait now gets
+  its own budget.
+- **A host bound to a wildcard address could be rolled back for being alive.** The
+  restart payload carries where the host LISTENED, and `0.0.0.0` / `[::]` are not
+  addresses anything can be dialled as; the helper's port probes read that as an
+  idle port, so the replacement started over a live server, and with recovery
+  armed a healthy new host was rolled back to the previous version for never
+  answering a probe that could never connect. Probes now go to loopback whenever
+  the bind address is a wildcard, and stay on the real address when it is one.
+- **One dropped request ended the panel's follow-up of a running install.** A
+  single refused `/status` cleared `busy`, printed the fetch failure as though the
+  update itself had failed, and killed the log the user was watching mid-install.
+  Misses are now counted (three in a row, reset by any answer). The absence that
+  is genuinely not a hiccup — the plugin's host half never mounted — is still
+  reported at once, since retrying that only hides it.
+- **A restart could be asked for twice, and a request that never answered froze
+  the page forever.** The countdown expiring and a click on "Restart now" are the
+  same intent arriving twice; the second POST goes to a process already on its way
+  out, and the watchdog loop ran twice on one page. In-flight is now state of its
+  own, released only when the handoff is refused outright or the wait gives up.
+  Requests also carry a deadline, and an aborted one is classified the way a
+  dropped connection is — the host may have taken the hint and exited — so the
+  page keeps watching instead of declaring a failure it cannot tell from a
+  refusal.
+
+### Tests
+
+The relaunch helper has end-to-end coverage for the first time: it is run as a
+real process against a real payload (with shortened budgets through a field only
+tests write), covering the two budgets, a rollback that fires when a replacement
+never answers, a healthy replacement left alone, and the payload being consumed so
+a stale file can never relaunch anything later. Suite: 143 cases.
+
+## [1.1.3] - 2026-09-12
+
+### Fixed
+
+- **"Later" in the restart dialog did not defer the restart — the host restarted
+  anyway.** The cancel call passed no body, so the browser sent it as a GET, the
+  POST-only route answered 405, and the caller's `catch {}` read that as "there
+  was nothing pending". A fallback restart the host had armed on its own (policy
+  `restart: 'auto'`, or a restart requested from a second tab) stayed armed and
+  fired on its own schedule: the machine went into the new version under a panel
+  that had just promised it would not. The cancel is now an explicit empty POST,
+  the *offered* (not armed) restart defers through the same disarm path, and the
+  browser tests' fetch double records request methods — a deferral arriving as a
+  GET can no longer pass for one.
+- **Install progress could not move off 100 %.** The snapshot copy reported
+  `{ phase, files, bytes, ...total }`, spreading the measured TOTAL over its own
+  live counts: every tick's `bytes` *was* the total and `totalBytes` never
+  arrived at all, so the percentage the panel renders had exactly one value it
+  could ever compute. The totals now ride along as their own fields beside the
+  live counts, and the contract is asserted against a fresh `measureTree` of the
+  very tree being copied.
+- **The panel claimed "already up to date" when it could not read the
+  registry.** A degraded `/check` answers with `publishedError` and NO channels
+  at all, so "nothing is ahead" was an empty list proving nothing — the one claim
+  the data could not support, shown in the one sentence users act on. The verdict
+  is now a named, testable function that says it cannot tell instead
+  (`未能读取发布信息` / "Release information could not be read"), present in both
+  dictionaries.
+- **One bad `registry` value unmounted the whole plugin.** The registry is
+  normalized at mount, and a value that is not an absolute http(s) URL threw out
+  of `apply()`: the settings page reported "host routes are not mounted" and sent
+  the user to restart a host that was otherwise fine, while the real problem was
+  a typo in one field. The entry schema rejects the shape up front (the message
+  attaches to the field), and a value that still escapes normalization falls back
+  to the default registry with a loud `console.error`. An unwritable state
+  directory degrades the same way — persistence fails, the mount survives — and a
+  policy now becomes effective only after it is on disk, so memory and disk
+  cannot disagree about what is running.
+- **The machine-wide update lock could be deleted by a run that no longer held
+  it.** Lock records named only their pid, and `release()` removed whatever was in
+  the file. A fiber reload leaves the previous runner's child listeners attached,
+  so the orphan's late settlement unlocked the lock the NEWER run had taken —
+  after which a second host was free to run `npm install -g` against a tree two
+  of them were writing. Records carry a token now, and release deletes only while
+  it still owns the record; the preparation claim is a monotonic token for the
+  same reason, and slot, claim, and lock all go free through one
+  identity-checked path.
+- **A refused start left the machine locked for an hour.** The lock was acquired
+  before the npm CLI and the registry were validated, so every start that never
+  spawned anything — a bad `registry`, an install already running — still left a
+  lock file behind that other hosts honored until the maximum age (one hour)
+  expired. Validation comes first now, and a refusal leaves nothing.
+- **Killing a wedged npm freed the tree before npm had stopped writing it.** The
+  hard ceiling killed the child and settled the task in the same tick, releasing
+  slot and lock while the killed process was still mid-rename. The task still
+  reports failed at once (the panel must not keep saying "running"), but the slot
+  and the lock stay claimed until the child reports its exit, bounded by a
+  five-second grace. `updater.busy()` exposes the wider question anything
+  touching the tree has to answer first — a live npm, a snapshot copy not yet
+  handed over, or a killed npm not yet reaped — and the post-failure repair pass
+  defers on it and on the lock, so it can no longer restore the tree a second host
+  is installing into.
+- **A snapshot restore could overwrite the tree while an install was writing it,
+  and froze the host while doing so.** The panel's restore path took no lock (it
+  only checked whether *this* host had a task running) and copied the tree back
+  with synchronous recursive IO, blocking the event loop — every route, the
+  polling panel, any live session — for its whole duration. Restores now contend
+  on the same machine-wide lock an install holds, a contended lock answers 409
+  with a retry hint instead of 500, the swap itself runs off the event loop and
+  leaves nothing renamed-aside on either outcome, and the route awaits it — a
+  reply can no longer announce a rollback that has not happened. A restore whose
+  copy fails puts the previous tree back and names the directory it could not
+  clear.
+
+The suite covers each of the above (130 cases), and no longer acquires — or is
+refused by — the machine-wide lock real hosts share: the updater tests contend on
+a temporary file of their own, and the composition tests name their own.
+
+## [1.1.2] - 2026-09-11
+
+### Fixed
+
+- **Silent auto-update (`mode: 'auto'`) now actually fires on its own.** Two
+  wiring gaps made the policy unreachable in practice, so every update had to
+  be triggered by hand:
+  - The scheduler's daily check was a ONE-SHOT timer that never re-armed: even
+    with a configured `checkAt`, the scheduled check ran exactly once per host
+    process lifetime and then fell silent — the panel kept showing a "next
+    check" time that had already passed and would never fire. The timer now
+    re-arms itself after every fired cycle, and the fired handle is dropped
+    immediately so `nextCheckAt` stays honest while a cycle runs.
+  - Every panel check (page load or the check button) bypassed the scheduler
+    entirely: the `/check` route read the registry itself and never consulted
+    the auto-update decision. With `checkAt` left empty — the default — the
+    scheduler literally never ran, so `mode: 'auto'` could not install
+    anything, ever. A successful registry read is now handed to the scheduler
+    (`consider`), so an `auto` policy decides on every check: it installs
+    immediately when no window is configured, or parks the finding for the
+    execution window when one is. The composition wires this through; the
+    decision failing can never fail the panel's own read.
+
+## [1.1.1] - 2026-09-11
+
+### Fixed
+
+- **Restarting no longer leaves the host console-less, which popped black
+  "node.exe" windows around every operation (Windows).** The relauncher used
+  `detached: true` for the replacement, which starts it under DETACHED_PROCESS
+  — a process with NO console. Everything was fine while that host only
+  served pages, but every descendant spawned later without console flags —
+  dsh's own subprocess runner per tool call, plugin code, `stdio: 'inherit'`
+  spawns — made Windows allocate a fresh console for it, and from a
+  console-less parent those allocations surface as visible black windows on
+  the desktop, one per operation, until the host was started by hand again.
+  The replacement is now spawned with plain `windowsHide` (CREATE_NO_WINDOW):
+  it owns a real but hidden console that its whole descendant tree inherits,
+  so nothing downstream ever allocates a visible one — the same console state
+  a launcher-started host already had. The price is lifetime: Node terminates
+  non-detached children when their parent exits, so the relaunch helper now
+  stays alive as the replacement's supervisor for the host's whole lifetime
+  (invisible, zero-cost) and goes away only when the host exits; POSIX keeps
+  the old setsid-and-exit contract. Verified end to end: a restart hands the
+  port over, the replacement keeps running under its supervisor, both piped
+  and inherit-stdio descendants allocate no console of their own, and killing
+  the host takes the supervisor down with it.
+
+## [1.1.0] - 2026-09-10
+
+### Added
+
+- **A machine-wide update lock** (`lib/updatelock.js`). The install slot was
+  process-wide but not machine-wide: a desktop shell's host and a terminal
+  `dsh web` could run `npm install -g` against the same global tree at once.
+  `start()` now acquires a lock file (`%TEMP%\dsh-version-update.lock`) before
+  claiming the slot and `settle()` releases it. A lock whose holder is dead,
+  older than the hard-timeout ceiling, or unreadable is stolen — a leaked lock
+  never blocks updates forever; a live foreign holder turns the second install
+  into a clean refusal naming the holding pid.
+- **Post-install validation.** `npm exit 0` proves npm finished, not that dsh
+  can start. When the install directory is known, the runner now verifies the
+  manifest parses, reports the requested version, and `lib/bin.js` exists
+  before settling done; a broken tree settles failed so the host wiring
+  restores the pre-install snapshot instead of restarting into a dead install.
+- **An explicit restart command** for embedders. `createRestarter` accepts
+  `restartCommand: { execPath, args, cwd }`, which replaces the inherited
+  command line verbatim in the handoff payload — the recommended integration
+  for desktop wrappers whose argv is not a plain node invocation. The port
+  still comes from the listening address, so the replacement rebinds the
+  handed-over port even when the command predates this boot.
 
 ## [1.0.8]
+
+### Fixed
+
+- **A slow install is no longer killed into a half-committed global tree.**
+  The old 10-minute wall-clock cap stopped npm wherever it happened to be —
+  and npm mid-reify holds every replaced package under a retired temporary
+  name (`.name-hash`) that is only deleted when the run finishes. A kill at
+  that moment left the global installation half-committed (222 retired
+  folders under `@deepseek-ai/`, dsh itself possibly renamed away), which
+  broke the Web GUI until it was repaired by hand. The 10-minute mark is now
+  a SOFT deadline: the log notes the slowness and npm keeps running. Only a
+  hard ceiling (`INSTALL_HARD_TIMEOUT_MS`, one hour) stops a run that is
+  assumed wedged rather than working.
 
 ### Added
 
