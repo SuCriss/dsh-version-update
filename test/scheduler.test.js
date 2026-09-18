@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { createScheduler } from '../lib/scheduler.js'
+import { STARTUP_CHECK_MS, createScheduler } from '../lib/scheduler.js'
 import { DEFAULT_POLICY } from '../lib/protocol.js'
 
 const PUBLISHED = {
@@ -281,7 +281,7 @@ test('a fired daily check re-arms itself, so silent updates recur every day', as
   const armed = []
   const originalSetTimeout = globalThis.setTimeout
   const spy = (fn, ms, ...rest) => {
-    armed.push(fn)
+    armed.push({ fn, ms })
     // A far-future dummy: the re-armed timer must never actually fire here.
     const timer = originalSetTimeout(() => {}, 10 ** 9)
     timer.unref?.()
@@ -290,16 +290,94 @@ test('a fired daily check re-arms itself, so silent updates recur every day', as
   globalThis.setTimeout = /** @type {any} */ (spy)
   try {
     scheduler.start()
-    assert.equal(armed.length, 1, 'start armed the daily check exactly once')
-    armed[0]() // the scheduled moment arrives
+    // `mode: 'auto'` arms two timers at start: the daily check and the one-shot
+    // startup check. Only the daily one is expected to recur.
+    const startup = armed.filter(entry => entry.ms === STARTUP_CHECK_MS)
+    assert.equal(startup.length, 1, 'start armed the one-shot startup check')
+    const daily = armed.find(entry => entry.ms !== STARTUP_CHECK_MS)
+    assert.ok(daily !== undefined, 'start armed the daily check')
+    daily.fn() // the scheduled moment arrives
     // Drain every microtask the cycle and its re-arm produce.
     await new Promise(resolve => setImmediate(resolve))
     assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }], 'the scheduled cycle installed silently')
-    assert.equal(armed.length, 2, 'the fired check re-armed the next occurrence instead of falling silent')
+    assert.equal(armed.length, 3, 'the fired check re-armed the next occurrence instead of falling silent')
+    assert.equal(armed.filter(entry => entry.ms === STARTUP_CHECK_MS).length, 1, 'the startup check is one-shot and did not re-arm')
   } finally {
     globalThis.setTimeout = originalSetTimeout
     scheduler.dispose()
   }
+})
+
+test('the startup check runs one automatic cycle with no panel and no checkAt', async () => {
+  const { state, scheduler } = harness()
+  // No checkAt at all: the daily timer cannot arm, so this is the ONLY thing
+  // that can keep a silent policy current on a host that is off at 03:00.
+  state.policy = { ...DEFAULT_POLICY, mode: 'auto' }
+  const spy = spyTimers()
+  try {
+    scheduler.start()
+    assert.equal(scheduler.view().nextCheckAt, undefined, 'no checkAt means no daily timer')
+    const startup = spy.armed.find(entry => entry.ms === STARTUP_CHECK_MS)
+    assert.ok(startup !== undefined, 'mode auto arms the one-shot startup check')
+    startup.callback()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }], 'the startup cycle installed silently')
+    assert.equal(scheduler.view().lastCheck.target, '0.5.0')
+  } finally { scheduler.dispose(); spy.restore() }
+})
+
+test('modes that only report arm no background startup check', async () => {
+  for (const mode of ['off', 'notify']) {
+    const { state, scheduler } = harness()
+    state.policy = { ...DEFAULT_POLICY, mode }
+    const spy = spyTimers()
+    try {
+      scheduler.start()
+      assert.deepEqual(spy.armed, [], `${mode} arms nothing at startup`)
+    } finally { scheduler.dispose(); spy.restore() }
+  }
+})
+
+test('the startup check re-reads the policy when it fires, so switching to off cancels it', async () => {
+  // What this check actually buys is the registry round-trip, not the install:
+  // `consider` would refuse a non-auto mode anyway. Asserting only "nothing
+  // installed" would pass even with the re-read deleted — the assertion has to
+  // name the request that never happens.
+  let checks = 0
+  const { state, scheduler } = harness({ check: async () => { checks += 1; return PUBLISHED } })
+  state.policy = { ...DEFAULT_POLICY, mode: 'auto' }
+  const spy = spyTimers()
+  try {
+    scheduler.start()
+    const startup = spy.armed.find(entry => entry.ms === STARTUP_CHECK_MS)
+    assert.ok(startup !== undefined)
+    // The delay is a window in which the user can change their mind.
+    state.policy = { ...DEFAULT_POLICY, mode: 'off' }
+    startup.callback()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(checks, 0, 'a cancelled check does not even reach the registry')
+    assert.deepEqual(state.started, [], 'the delayed check honours the policy it finds, not the one it armed under')
+  } finally { scheduler.dispose(); spy.restore() }
+})
+
+test('turning auto on arms the startup check the boot under off never armed', async () => {
+  const { state, scheduler } = harness()
+  state.policy = { ...DEFAULT_POLICY, mode: 'off' }
+  const spy = spyTimers()
+  try {
+    scheduler.start()
+    assert.deepEqual(spy.armed, [], 'off arms nothing at boot')
+    // Without this the panel's acting read — which ran while the OLD mode was
+    // in force — would be the last automatic check until the next checkAt, or
+    // forever with none configured.
+    state.policy = { ...DEFAULT_POLICY, mode: 'auto' }
+    scheduler.policyChanged()
+    const startup = spy.armed.find(entry => entry.ms === STARTUP_CHECK_MS)
+    assert.ok(startup !== undefined, 'the policy edit armed the check the boot skipped')
+    startup.callback()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }])
+  } finally { scheduler.dispose(); spy.restore() }
 })
 
 test('consider decides from pre-fetched facts, so a check can trigger the install without any timer', async () => {
@@ -320,7 +398,10 @@ test('cancelPending clears window wakes and busy retries but keeps the daily che
     state.refuse = busy
     try {
       scheduler.start()
+      // Three timers are now live: the daily check, the one-shot startup check,
+      // and the wake `consider` arms for the finding it parks.
       const daily = spy.armed[0]
+      assert.notEqual(daily.ms, STARTUP_CHECK_MS, 'the daily check is armed first')
       await scheduler.consider(PUBLISHED)
       const wake = spy.armed.at(-1)
       const before = scheduler.view()
@@ -336,12 +417,12 @@ test('cancelPending clears window wakes and busy retries but keeps the daily che
       clock = new Date('2026-03-02T04:00:00')
       wake.callback() // A callback queued before cancellation is inert too.
       assert.deepEqual(state.started, [])
-      assert.equal(spy.armed.length, 2)
+      assert.equal(spy.armed.length, 3)
       // The daily timer still fires and re-arms; cancellation is not a policy edit.
       daily.callback()
       await new Promise(resolve => setImmediate(resolve))
       assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }])
-      assert.equal(spy.armed.length, 3)
+      assert.equal(spy.armed.length, 4)
     } finally { scheduler.dispose(); spy.restore() }
   }
 })

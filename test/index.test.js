@@ -92,6 +92,7 @@ test('apply mounts the full core family; notes stay off without a repo slug', (t
   const paths = ctx.registered.map(route => route.path).sort()
   assert.deepEqual(paths, [
     VERSION_API.check,
+    VERSION_API.checkAuto,
     VERSION_API.checkRun,
     VERSION_API.restartDiagnostics,
     VERSION_API.policy,
@@ -209,23 +210,36 @@ test('snapshots start empty and restore reports a missing snapshot as conflict',
   assert.match(progress.body.result.events[1].error, /no usable snapshot/)
 })
 
-test('a panel check feeds the scheduler, so the auto decision runs without any daily timer', async (t) => {
+test('only the acting check feeds the auto decision, so a read never parks work', async (t) => {
   const { dataDir } = environment(t)
   const ctx = fakeCtx()
   apply(ctx, { dataDir })
-  // notify: the decision records its finding but never installs — the wiring
-  // is proven without letting the composition spawn a real npm install.
-  await invoke(ctx.registered, VERSION_API.policy, { method: 'POST', body: { mode: 'notify' } })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+  // auto + a window that is closed at whatever minute this suite runs. The
+  // ACTING read parks its finding — visible as pendingAuto — and the OBSERVING
+  // read does not. Neither spawns npm, so the two paths are told apart without
+  // letting the composition run a real install.
+  const now = new Date()
+  const stamp = m => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`
+  const at = (now.getHours() * 60 + now.getMinutes() + 30) % 1440
+  await invoke(ctx.registered, VERSION_API.policy, {
+    method: 'POST',
+    body: { mode: 'auto', window: { start: stamp(at), end: stamp((at + 1) % 1440) } },
+  })
   const savedFetch = globalThis.fetch
   globalThis.fetch = /** @type {any} */ (async () => ({
     ok: true,
     json: async () => ({ 'dist-tags': { latest: '9.9.9' }, versions: { '9.9.9': {}, '0.4.0': {} } }),
   }))
   try {
-    const res = await invoke(ctx.registered, VERSION_API.check)
-    assert.equal(res.status, 200)
-    assert.equal(res.body.result.lastCheck.updateAvailable, true, 'the panel check reached the scheduler')
-    assert.equal(res.body.result.lastCheck.target, '9.9.9')
+    const read = await invoke(ctx.registered, VERSION_API.check)
+    assert.equal(read.status, 200)
+    assert.equal(read.body.result.lastCheck.target, '9.9.9', 'the read still records what it saw')
+    assert.equal(read.body.result.pendingAuto, undefined, 'but a GET never parks automatic work')
+
+    const acted = await invoke(ctx.registered, VERSION_API.checkAuto, { method: 'POST' })
+    assert.equal(acted.status, 200)
+    assert.equal(acted.body.result.pendingAuto?.target, '9.9.9', 'the acting check is what the policy acts on')
   } finally {
     globalThis.fetch = savedFetch
   }
@@ -416,4 +430,33 @@ test('a restore yields to another host that holds the machine-wide lock', async 
   assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.9.0', 'the other host\'s tree is untouched')
   // The refusal left the foreign lock exactly where it was.
   assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).token, 'foreign')
+})
+
+test('a restore keeps the version it replaces, so the rollback can itself be rolled back', async (t) => {
+  const { installDir, dataDir } = environment(t)
+  const snapshotsDir = join(dataDir, 'snapshots')
+  assert.deepEqual(await createSnapshotAsync({ installDir, snapshotsDir, version: '0.4.0', now: () => 1000 }), { ok: true })
+  // An install moved the live tree forward and snapshotted only what it
+  // REPLACED, so 0.9.0 — the version now on disk — has no rollback point.
+  // Restoring 0.4.0 from here used to be one-way.
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.9.0' }))
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+  const res = await invoke(ctx.registered, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.4.0')
+
+  const listed = await invoke(ctx.registered, VERSION_API.snapshots)
+  assert.deepEqual(
+    listed.body.result.snapshots.map(entry => entry.version).sort(),
+    ['0.4.0', '0.9.0'],
+    'the version left behind is restorable now',
+  )
+  // The composition's own restore is the only path that adopts: the automatic
+  // repairs must not enshrine a tree they are about to overwrite as broken.
+  const back = await invoke(ctx.registered, VERSION_API.restore, { method: 'POST', body: { version: '0.9.0' } })
+  assert.equal(back.status, 200, JSON.stringify(back.body))
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.9.0')
 })

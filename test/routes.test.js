@@ -102,7 +102,7 @@ test('the full route family registers; optional routes appear only when wired', 
   // only notes/policy/snapshots appear when their operations are wired.
   const bare = harness()
   assert.deepEqual(bare.routes.map(r => r.path).sort(), [
-    VERSION_API.check, VERSION_API.checkRun, VERSION_API.operations, VERSION_API.restart, VERSION_API.status, VERSION_API.update,
+    VERSION_API.check, VERSION_API.checkAuto, VERSION_API.checkRun, VERSION_API.operations, VERSION_API.restart, VERSION_API.status, VERSION_API.update,
   ])
 })
 
@@ -248,11 +248,13 @@ test('a registry that answers with an HTTP error does not fall back', async () =
   assert.equal(res.body.result.channels, undefined)
 })
 
-test('a successful check hands its registry facts to the auto-update decision', async () => {
-  const considered = []
-  const { routes } = harness({
+test('the panel read observes and never reaches the auto-update decision', async () => {
+  let autoCalls = 0
+  let observeCalls = 0
+  const { routes, started } = harness({
     deps: {
-      auto: async (published) => { considered.push(published) },
+      auto: async () => { autoCalls += 1 },
+      manualCheck: async () => { observeCalls += 1 },
       fetchImpl: async () => ({
         ok: true,
         json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {}, '0.4.0': {} } }),
@@ -261,9 +263,31 @@ test('a successful check hands its registry facts to the auto-update decision', 
   })
   const res = await invoke(routes, VERSION_API.check)
   assert.equal(res.status, 200)
+  assert.equal(autoCalls, 0, 'a GET must not be able to start an install')
+  assert.equal(observeCalls, 1, 'it still records what it read')
+  assert.deepEqual(started, [], 'nothing was installed by a read')
+})
+
+test('the acting check is POST-only, fenced, and reaches the auto decision', async () => {
+  const considered = []
+  const { routes } = harness({
+    deps: {
+      auto: async (published) => { considered.push(published) },
+      manualCheck: async () => { assert.fail('the acting check must not take the observing path') },
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {}, '0.4.0': {} } }),
+      }),
+    },
+  })
+  assert.equal((await invoke(routes, VERSION_API.checkAuto)).status, 405)
+  assert.equal((await invoke(routes, VERSION_API.checkAuto, { method: 'POST', fenced: false })).status, 403)
+  const res = await invoke(routes, VERSION_API.checkAuto, { method: 'POST' })
+  assert.equal(res.status, 200)
   assert.equal(considered.length, 1, 'the check reached the scheduler exactly once')
   assert.deepEqual(considered[0].distTags, { latest: '0.5.0' })
   assert.deepEqual(considered[0].versions, ['0.5.0', '0.4.0'])
+  assert.equal(res.body.result.installed, '0.4.0')
 })
 
 test('a failed registry read never reaches the auto-update decision', async () => {
@@ -274,12 +298,12 @@ test('a failed registry read never reaches the auto-update decision', async () =
       fetchImpl: async () => { throw new Error('EAI_AGAIN') },
     },
   })
-  const res = await invoke(routes, VERSION_API.check)
+  const res = await invoke(routes, VERSION_API.checkAuto, { method: 'POST' })
   assert.equal(res.status, 200)
   assert.equal(calls, 0, 'without registry facts there is nothing to decide from')
 })
 
-test('a throwing auto decision cannot fail the panel check', async () => {
+test('a throwing auto decision cannot fail the acting check', async () => {
   const { routes } = harness({
     deps: {
       auto: async () => { throw new Error('decision exploded') },
@@ -289,7 +313,7 @@ test('a throwing auto decision cannot fail the panel check', async () => {
       }),
     },
   })
-  const res = await invoke(routes, VERSION_API.check)
+  const res = await invoke(routes, VERSION_API.checkAuto, { method: 'POST' })
   assert.equal(res.status, 200)
   assert.equal(res.body.result.installed, '0.4.0')
 })

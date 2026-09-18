@@ -303,3 +303,80 @@ test('the async snapshot reports live counts against the measured totals', async
   assert.equal(copies.at(-1).bytes, expected.bytes, 'the last report is the completed copy')
   assert.equal(measure[0].totalBytes, expected.bytes)
 })
+
+test('listing is metadata-level, and the restore is where the byte check still bites', (t) => {
+  const installDir = fakeInstall(t, '1.4.0')
+  const snapshotsDir = snapHome(t)
+  assert.equal(createSnapshot({ installDir, snapshotsDir, version: '1.4.0' }).ok, true)
+  // Damage only the byte check can see: a non-manifest file changed, so the
+  // metadata and the naming still agree. The panel's poll path must not walk
+  // 26 513 files per snapshot to discover this — listing says "structurally
+  // fine", and the restore, which cannot afford to be wrong, refuses.
+  writeFileSync(join(snapshotsDir, '1.4.0', 'lib', 'bin.js'), '// overwritten by something else')
+  assert.equal(listSnapshots(snapshotsDir)[0].usable, true, 'listing does not walk the tree')
+  const outcome = restoreSnapshot({ installDir, snapshotsDir, version: '1.4.0' })
+  assert.equal(outcome.ok, false)
+  assert.match(outcome.error, /no usable snapshot of 1\.4\.0/)
+  // The refusal came before anything touched the live installation.
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '1.4.0')
+})
+
+test('a restore keeps the tree it replaces as a snapshot of the version left behind', async (t) => {
+  const installDir = fakeInstall(t, '1.0.0')
+  const snapshotsDir = snapHome(t)
+  assert.equal(createSnapshot({ installDir, snapshotsDir, version: '1.0.0' }).ok, true)
+  // The install that moved the tree forward never snapshotted 2.0.0 — which is
+  // the ordinary case, because a snapshot is taken of the version being
+  // REPLACED. Without adoption this restore would be one-way.
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '2.0.0' }))
+  const outcome = await restoreSnapshotAsync({ installDir, snapshotsDir, version: '1.0.0', adopt: { keep: 5 } })
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.backup, '2.0.0', 'the version left behind is now restorable')
+  assert.deepEqual(listSnapshots(snapshotsDir).map(entry => entry.version).sort(), ['1.0.0', '2.0.0'])
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '1.0.0')
+  // It is a real snapshot, not a bookmark: it restores back to 2.0.0.
+  assert.deepEqual(await restoreSnapshotAsync({ installDir, snapshotsDir, version: '2.0.0' }), { ok: true })
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '2.0.0')
+  // Neither swap left a replaced-aside tree beside the installation.
+  assert.deepEqual(readdirSync(dirname(installDir)).filter(name => name.includes('.replaced-')), [])
+})
+
+test('adoption is skipped when the version left behind already has an intact snapshot', async (t) => {
+  const installDir = fakeInstall(t, '1.0.0')
+  const snapshotsDir = snapHome(t)
+  assert.equal(createSnapshot({ installDir, snapshotsDir, version: '1.0.0', now: () => 1 }).ok, true)
+  // A snapshot of the version now on disk already exists — keeping a second
+  // copy of the same version would only cost disk, so the tree is discarded.
+  const live = fakeInstall(t, '2.0.0')
+  assert.equal(createSnapshot({ installDir: live, snapshotsDir, version: '2.0.0', now: () => 2 }).ok, true)
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '2.0.0' }))
+  const outcome = await restoreSnapshotAsync({ installDir, snapshotsDir, version: '1.0.0', adopt: {} })
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.backup, '2.0.0', 'the existing snapshot already covers it')
+  assert.deepEqual(listSnapshots(snapshotsDir).map(entry => entry.version).sort(), ['1.0.0', '2.0.0'])
+  assert.deepEqual(readdirSync(dirname(installDir)).filter(name => name.includes('.replaced-')), [])
+})
+
+test('adoption never evicts the snapshot a restore is moving TO', async (t) => {
+  const snapshotsDir = snapHome(t)
+  // A full store, with the restore target as its OLDEST entry — the shape a
+  // user reaches when they roll back the furthest, and exactly what a prune
+  // ordered by age would delete first.
+  const versions = ['1.0.0', '1.0.1', '1.0.2']
+  for (const [index, version] of versions.entries()) {
+    const dir = fakeInstall(t, version)
+    assert.equal(createSnapshot({ installDir: dir, snapshotsDir, version, keep: 3, now: () => index }).ok, true)
+  }
+  const installDir = fakeInstall(t, '2.0.0')
+  const outcome = await restoreSnapshotAsync({
+    installDir,
+    snapshotsDir,
+    version: '1.0.0',
+    adopt: { keep: 3, protect: ['1.0.0'] },
+  })
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.backup, '2.0.0')
+  const listed = listSnapshots(snapshotsDir).map(entry => entry.version).sort()
+  assert.ok(listed.includes('1.0.0'), `the version restored to survived the adoption prune: ${listed.join(', ')}`)
+  assert.equal(listed.length, 3, 'and the store still respects its retention')
+})

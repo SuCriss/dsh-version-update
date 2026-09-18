@@ -3,6 +3,91 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.4.0] - 2026-09-18
+
+### Added
+
+- **A silent policy now gets one guaranteed check per boot.** `checkAt` names a
+  single wall-clock moment, so a host that was off at that moment lost the whole
+  day — and a host whose lifetime never contained it lost every day, which made
+  `mode: 'auto'` look inert on any machine that is not running at the configured
+  time. The scheduler now arms a one-shot check `STARTUP_CHECK_MS` (60 s) after
+  start. Armed only for `mode: 'auto'`: `off` and `notify` are the user saying
+  "tell me, do not act", and neither needs a background registry read. The mode
+  is re-read when the timer fires rather than trusted from arming time, so a
+  policy edited during the delay is honoured — and switching away from `auto`
+  costs nothing, not even the registry round-trip. `policyChanged` re-arms it,
+  because turning `auto` ON is the user asking for unattended installs while the
+  panel's own acting read has already run under the OLD mode; without that, a
+  host booted under `off` and switched to `auto` would not check until the next
+  `checkAt`, or never with none configured.
+
+### Fixed
+
+- **A GET could replace the installation tree.** `GET /check` fed the
+  auto-update decision, so *any* request to that URL — a browser prefetch, a
+  second tab, any local process that walks the loopback route family — could
+  start a silent install and rewrite 551 MB of files. Meanwhile the panel's own
+  explicit check button was guaranteed never to install, which is the direction
+  backwards. The route is now observation-only: it refreshes the scheduler's
+  facts so the panel's "last check" stays honest, and it can never install or
+  park. The acting read moved to a new `POST /check/auto`, which the panel calls
+  once when it opens — that mount is what keeps a silent `mode: 'auto'` with no
+  `checkAt` reachable at all.
+- **A rollback undid itself.** The refresh that follows a restore used the bare
+  read, which feeds the automatic decision — so under `mode: 'auto'`, restoring
+  to an older version was followed seconds later by a silent install of the very
+  version the user had just rolled away from, while the page still showed the
+  older one. That refresh now observes.
+- **Reading the snapshots card parked the whole host.** `listSnapshots` validated
+  every entry by running `inventory()` — a full recursive `lstat` of the tree —
+  and diffing it against `meta.json` with `JSON.stringify`. On this machine's
+  installation (26 513 files / 551 MB) one inventory measures 1.578 s, and the
+  panel reads the list on every check, so a few snapshots blocked the event loop
+  for seconds at a time. Validation is now two-tiered: listing and pruning read
+  metadata only (a self-consistent `meta.json` whose declared version matches the
+  directory name), while the two paths that cannot be undone — restoring, and
+  reusing an existing snapshot — still run the full inventory comparison. That is
+  sound because a snapshot only reaches a version name by being renamed *after*
+  its copy completes; a torn copy lives under `.tmp-*` and is never a version
+  name.
+- **A restore was irreversible.** Restoring copied the snapshot over the
+  installation, so the version it replaced was simply gone. `restoreSnapshotAsync`
+  now adopts the tree it renames aside as a snapshot of the version that tree
+  holds (`adoptSnapshot`) — a same-volume rename, never a copy, so the extra cost
+  is one inventory walk (1.6 s) rather than the 87.91 s a full copy of this tree
+  measures. A rollback can therefore be rolled back. When the replaced version
+  already holds an intact snapshot the adoption is skipped, and the adoption's
+  own pruning is told to protect the version the restore is moving to.
+- **The restore path reported its own success as a failure.** A restore copies
+  the whole tree — 87.91 s measured here — while the panel aborted every request
+  at 15 s. The panel now names the version being restored (`正在恢复 <版本>`) and
+  raises that one request's budget to 10 minutes.
+- **A refused action was silent.** The panel rendered `state.error` only when
+  `state.status === 'error'`, so a refused restore, a failed snapshot delete and
+  a rejected policy save — all of which leave the status at `ready` — produced no
+  visible feedback at all. Any `error` now renders.
+- **A snapshot only the byte check rejects blocked the repair.** `repairTree`
+  picked the newest candidate and restored it once; a snapshot that passed the
+  metadata check but failed the byte check failed the whole repair without
+  trying the next candidate. It now walks candidates newest-first until one
+  restores, and a successful repair no longer folds the failed candidates into
+  its health verdict.
+
+### Changed
+
+- New endpoint `POST /api/dsh-version-update/check/auto` — the only check that
+  lets the update policy act. `GET /check` and `POST /check/run` now both
+  observe. All three still refresh `lastCheck`.
+- `POST /snapshots/restore` results may carry `backup` (the version that was
+  adopted as a snapshot) and `backupError` (why the adoption failed; the restore
+  itself still succeeds).
+- Snapshot rows render the payload size the host has always sent (`entry.bytes`).
+
+### Removed
+
+- Dead export `CHANNELS` — zero references repo-wide.
+
 ## [1.3.0] - 2026-09-18
 
 ### Changed

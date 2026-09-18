@@ -2,7 +2,7 @@
 
 English | [中文](README.md)
 
-The "Version Update" settings menu for the DeepSeek Harness Web GUI — fully rewritten for v1.0. Beyond inspecting and installing any published `@deepseek-ai/dsh` version, this generation turns updating into a **manageable version policy**: silent auto-update, execution windows, a daily scheduled check, dist-tag and version-line tracking, and second-level rollback from local snapshots.
+The "Version Update" settings menu for the DeepSeek Harness Web GUI — fully rewritten for v1.0. Beyond inspecting and installing any published `@deepseek-ai/dsh` version, this generation turns updating into a **manageable version policy**: silent auto-update, execution windows, a daily scheduled check, dist-tag and version-line tracking, and offline rollback from local snapshots — no npm, no network, and a rollback can itself be rolled back.
 
 ## Features
 
@@ -20,7 +20,8 @@ The "Version Update" settings menu for the DeepSeek Harness Web GUI — fully re
 ### Snapshot rollback (new)
 
 - **Every install first snapshots the current version** to `~/.dsh-version-update/snapshots/<version>/`; a failed snapshot is logged, never blocking.
-- Rolling back = copying a snapshot over the installation: **no npm, no network, usually seconds**. Restore renames the live tree aside first and moves it back if the copy fails midway.
+- Rolling back = copying a snapshot over the installation: **no npm, no network**. Restore renames the live tree aside first and moves it back if the copy fails midway. The cost is a **full tree copy**: 26,513 files / 551 MB measured ~88 s, so the panel names the version being restored and stretches that one request's timeout from 15 s to 10 minutes — otherwise a success still in progress gets reported as a failure.
+- The version being replaced **is adopted as a snapshot** (a same-volume rename, never a copy), so a rollback can itself be rolled back; if that version already holds an intact snapshot the adoption is skipped rather than duplicating it.
 - The "Snapshots & rollback" card lists every usable snapshot with one-click restore through the same confirm + restart flow.
 - Snapshots are pruned automatically (5 retained by default); damaged entries are removed first and marked unusable in the list.
 - Optional `recoverOnFailedRestart`: when a restarted host never becomes reachable within 60 seconds, the relaunch helper restores the previous version from its snapshot — again without npm or network.
@@ -34,9 +35,9 @@ Policy persists at `~/.dsh-version-update/policy.json` and hot-applies from the 
 | `mode` | `off` / `notify` / `auto` | On discovery: display only / highlight / **install silently** |
 | `track` | `{kind:'tag', tag}` / `{kind:'line', range}` / `{kind:'pin'}` | Follow a dist-tag (custom tags welcome) / follow a `^x.y.z` or `~x.y.z` line (stable only) / pin |
 | `window` | `null` or `{start,end}` (`HH:MM`) | Execution window for `auto`; midnight wrap supported (22:00–06:00), equal bounds mean all day; findings outside the window park until it opens |
-| `checkAt` | `null` or `HH:MM` | Daily scheduled check |
+| `checkAt` | `null` or `HH:MM` | Daily scheduled check; `null` disables the daily timer |
 
-The scheduler is two boring timers over pure decisions (`resolveTarget` / `inWindow`), so the whole policy is exhaustively testable. Discoveries update the panel's status line; `auto` mode parks out-of-window findings instead of ever installing outside the window.
+The scheduler is three boring timers over pure decisions (`resolveTarget` / `inWindow`), so the whole policy is exhaustively testable. An automatic check has three triggers: **60 s after the host boots** (`auto` mode only, once per boot), the configured daily `checkAt` moment, and opening the settings panel. The boot check is what makes `auto` reliable — `checkAt` names a single moment, and a machine that is off at that moment misses the whole day, whereas the boot check guarantees one check per start. Discoveries update the panel's status line; `auto` mode parks out-of-window findings instead of ever installing outside the window.
 
 - **Pending auto-install management**: the panel shows the waiting target version and when it was queued, with a cancel action that disarms its window wake / busy retry. It does not stop an install already running or change the policy or daily check; later automatic checks may schedule an update again.
 
@@ -58,7 +59,8 @@ The host therefore records the booted `running` version against the on-disk `ins
 Three halves in one package:
 
 - **Host half** (`lib/`, exports `.`) mounts the loopback-only route family:
-  - `GET /check` — local facts + registry channels/versions + task view + ambient (last check verdict, next scheduled run, parked target, recent activity); degrades to `publishedError` when the registry is unreachable
+  - `GET /check` — read-only: local facts + registry channels/versions + task view + ambient (last check verdict, next scheduled run, parked target, recent activity); degrades to `publishedError` when the registry is unreachable. It refreshes what the panel displays and **never installs or parks anything** — those two are the explicit paths below
+  - `POST /check/run`, `POST /check/auto` — explicit checks that differ in exactly one way: `/check/run` observes (the panel's check button, the refresh after a cancellation), while `/check/auto` lets the policy **act** and may install silently (called once when the panel opens). The latter has to be a POST: a GET that can replace the whole installation tree is reachable by a prefetch, a second tab, or any process that walks the loopback ports. All three refresh `lastCheck`
   - `POST /update` — `{version, source?}` starts one install (trigger always recorded as manual; `source` accepts only the identifiers `auto`/`official`/`mirror` and **never a URL** — registry addresses stay in host config, anything else is a 400)
   - `GET /status` — task view (`running`/`stale`/`needsRestart`/`restartable`) + ambient
   - `POST /restart` — three-step handoff, called by the panel's "Restart now" button
@@ -104,20 +106,25 @@ Runtime behavior (mode, tracking, window, schedule) lives in the policy file edi
 - Install preflight: the install confirmation card uses loopback-only `GET /api/dsh-version-update/preflight` to check npm, install-parent writes, free disk space and snapshot storage (`dataDir` aware). Failures become advisory warnings, unknown space is `null`; no npm execution or network calls.
 
 - New snapshots show payload size and support confirmed deletion. Deletion is refused while an install is running — the snapshot taken moments ago is the runner's own way out of a failure — and the discard itself only renames the directory, so the panel never waits on the unlink.
-- New inventories verify file paths, sizes and symlink targets before restoration. This is not content hashing. Legacy snapshots remain metadata-validated, explicitly labelled, and may have unknown size.
-- The check button uses `POST /check/run` to record a policy-aware verdict. Manual checks never install or create parked automatic jobs, even in auto mode.
+- New snapshots record file paths, sizes and symlink targets, and **validation comes in two tiers**: listing and pruning read metadata only (`meta.json` is self-consistent and the version it declares matches the directory name), while the two unrecoverable paths — restoring, and reusing an existing snapshot — do the full inventory comparison, refusing on any missing entry or changed size. This is not content hashing. Legacy snapshots remain metadata-validated, explicitly labelled, and may have unknown size.
+- Why not one tier everywhere: a 26,513-file inventory measures 1.6 s, and the list is read on every panel check — running that synchronously parks the entire host event loop. A snapshot only reaches a version name by being renamed *after* its copy completes, so torn copies live under `.tmp-*` and never appear in the list; metadata-level validation is sufficient there.
+- The check button uses `POST /check/run` to record a policy-aware verdict. Manual checks never install or create parked automatic jobs, even in auto mode. **The only reads that let the policy act are `POST /check/auto`** (once, when the panel opens) and the scheduler's own timers — it used to ride on `GET /check`, which gave a read endpoint an install side effect, i.e. exactly backwards.
 - Restart diagnostics read the fixed state-directory `restart.log` on demand, limited to a 16 KiB / 100-line tail with common credential patterns redacted. Review local paths and other details before sharing.
 - Missing npm and EACCES/EPERM failures offer terminal, prefix, cache-permission and file-lock guidance without automatic elevation.
-- New loopback-only endpoints under `/api/dsh-version-update`: `POST /snapshots/delete` (`{version}`), `POST /check/run`, `GET /restart/diagnostics`.
+- New loopback-only endpoints under `/api/dsh-version-update`: `POST /snapshots/delete` (`{version}`), `POST /check/run`, `POST /check/auto`, `GET /restart/diagnostics`.
 - Snapshot deletion now **renames to a `.trash-*` tombstone and unlinks in the background**. A recursive delete of a 200 MB snapshot measures in the seconds on Windows — long enough to freeze the whole host and to outlive the panel's 15 s request timeout, which is exactly why the button looked dead. The version leaves the list immediately and the bytes are reclaimed off the event loop; `.tmp-*` / `.trash-*` directories left by a killed process are swept at host start.
 
 ## Development
 
 ```sh
-npm test          # node:test — 165 cases across protocol/domain/routes/composition/browser controller/relaunch helper
+npm test          # node:test — 242 cases across protocol/domain/routes/composition/browser controller/relaunch helper
 npm run typecheck # tsc --checkJs strict — type safety without a build step
 ```
 
 The suite deliberately covers the contracts most likely to rot: agreement between the browser semver mirror and the host ranking, per-field fallback in policy normalization, snapshot metadata validation and prune ordering, process-wide single-slot exclusivity across fiber reloads, the countdown/watchdog chain under mocked clocks, machine-lock ownership (a release may only remove the record it still holds), the invariant that a parked auto update always has a next wake armed, the relaunch helper's two independent budgets and its dialable probe address, and the rule that a degraded read may never be presented as a conclusion.
 
 This round's contracts were chosen the same way — by asking which step degrades quietly: **the progress model may not invent numbers** (a phase with no denominator must be `indeterminate`, a phase with no signal may not report itself stalled), `source` accepts identifiers only and answers 400 otherwise (no URL may enter from the browser), npm must not be spawned even once when the snapshot cannot be written, and a readable manifest with a missing launcher must still be repaired from the snapshot.
+
+The fix round added contracts on the same principle: **the byte-level check may not creep back onto the hot path** (corrupt a snapshot's bytes and the list still calls it usable, while a restore must refuse it and leave the live tree untouched), **a restore must leave a way back** (the replaced version is adopted as a snapshot so a rollback can be rolled back; an existing intact snapshot is reused rather than duplicated; the adoption's pruning may not evict the restore's own target), **a snapshot only the byte check can reject may not block a repair** (candidates are tried newest-first, and a successful repair must not fold the failed candidates into its health verdict), and **a refused operation may not be swallowed** (an `error` under `status: 'ready'` has to reach the panel too).
+
+This round is about **which direction a read may act in**: **a GET may not carry an install side effect** (`GET /check` touches neither the auto decision nor the parked set), **the one read that lets the policy act must be a POST** (`POST /check/auto`), **only the panel's own mount is allowed to act** (it calls `check({ act: true })`, and the render is asserted to hit `/check/auto`), and **the refresh after a rollback may only observe** (otherwise, under `mode: 'auto'`, a restore reinstalls itself within seconds). Each of these was verified by reverting the fix and watching the assertion fail — none of them is a vacuous assertion.

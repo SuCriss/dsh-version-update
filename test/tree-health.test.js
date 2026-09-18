@@ -204,4 +204,35 @@ test('preferredVersion restores exactly that snapshot even when the tree looks h
   assert.equal(refused.restored, undefined)
   assert.equal(JSON.parse(readFileSync(join(other, 'package.json'), 'utf8')).version, '2.0.0')
   assert.ok(refused.errors.some(error => error.includes('9.9.9')))
+})
+
+test('a snapshot only the byte check rejects does not block the repair', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'dsh-vu-skip-'))
+  t.after(() => rmSync(base, { recursive: true, force: true }))
+  const build = (version) => {
+    const dir = join(base, `tree-${version}`)
+    mkdirSync(join(dir, 'lib'), { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version }))
+    writeFileSync(join(dir, 'lib', 'bin.js'), `console.log(${JSON.stringify(version)})`)
+    return dir
+  }
+  const snapshotsDir = join(base, 'snapshots')
+  assert.equal(createSnapshot({ installDir: build('1.2.0'), snapshotsDir, version: '1.2.0', now: () => 10 }).ok, true)
+  assert.equal(createSnapshot({ installDir: build('1.2.3'), snapshotsDir, version: '1.2.3', now: () => 20 }).ok, true)
+  // Damage the newest one in a way only the byte check can see — a non-manifest
+  // file gone, metadata and naming still agreeing. The store lists it as
+  // usable, so a repair that trusted the newest entry alone would fail on it
+  // and leave a tree dsh cannot start from.
+  rmSync(join(snapshotsDir, '1.2.3', 'lib', 'bin.js'))
+
+  const live = join(base, 'live')
+  mkdirSync(live, { recursive: true })
+  writeFileSync(join(live, 'package.json'), '{"name":"@deepseek-ai/dsh","version":"1.2.3"}')
+  rmSync(join(live, 'package.json')) // the npm kill happened mid-move
+
+  const outcome = repairTree({ installDir: live, snapshotsDir, minAgeMs: 0 })
+  assert.equal(outcome.restored, '1.2.0', 'the repair fell through to the entry it could use')
+  assert.equal(JSON.parse(readFileSync(join(live, 'package.json'), 'utf8')).version, '1.2.0')
+  assert.equal(outcome.errors.length, 0, 'a repair that succeeded is not reported as damaged')
+  assert.equal(outcome.manifestOk, true)
 })

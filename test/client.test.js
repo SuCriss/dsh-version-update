@@ -1327,3 +1327,106 @@ test('restore applies, leaves the restart to the button, and walks the watchdog'
     ctx.mock.timers.reset()
   }
 })
+
+test('a restore in flight is named, and a refused restore is not swallowed', async () => {
+  const client = await loadClient()
+  /** Released by the test to answer the in-flight restore. */
+  let answer
+  fakeFetch({
+    '/snapshots': () => json({ result: { snapshots: [{ version: '7.7.7', usable: true }] } }),
+    '/check': () => json({ result: { installed: '7.7.7', task: { state: 'idle', log: '' } } }),
+    '/operations': () => json({ result: { events: [] } }),
+    '/policy': () => json({ result: { policy: {} } }),
+    '/restore': () => new Promise((resolve) => {
+      answer = () => resolve(json({ error: 'no usable snapshot of 7.7.7' }, 409))
+    }),
+  }).install()
+  const controller = client.createController({ t })
+  await controller.check()
+  controller.requestRestore('7.7.7')
+  const pending = controller.confirmRestore()
+  await flush()
+
+  // A restore copies a whole package tree back — 88 s for this machine's dsh
+  // tree, against a 15 s default budget for every other route. The panel has
+  // to say what it is waiting for rather than sit silent for a minute, and it
+  // must not give up on the request and then blame the host for the timeout.
+  const inFlight = controller.getSnapshot()
+  assert.equal(inFlight.restoring, '7.7.7', 'the panel names the version it is restoring')
+  assert.equal(inFlight.busy, true, 'and stays locked while it runs')
+  assert.equal(inFlight.restoreConfirm, undefined, 'the confirmation card is gone')
+  // And the page actually renders that fact, rather than only holding it.
+  const render = () => client.VersionUpdateSection({
+    t, ...controller.inject(), useVersionUpdate: selector => selector(controller.getSnapshot()),
+  })
+  const waiting = findAll(render(), node => node.children?.[0] === t('snapshots.restoring'))
+  assert.equal(waiting.length, 1, 'the restore names itself in the snapshot card')
+
+  answer()
+  await pending
+  await flush()
+  const settled = controller.getSnapshot()
+  assert.equal(settled.restoring, undefined, 'the wait is over')
+  assert.equal(settled.busy, false)
+  // The failure is reported where the page can render it: a refused restore
+  // used to land in `error` with `status` still 'ready', which the section
+  // only rendered for a load failure — so the click did nothing visible.
+  assert.equal(settled.error, 'no usable snapshot of 7.7.7')
+  assert.equal(settled.status, 'ready', 'the page itself loaded fine')
+  const shown = findAll(render(), node => node.children?.[0] === 'no usable snapshot of 7.7.7')
+  assert.equal(shown.length, 1, 'the refusal reaches the page, and the wait line is gone')
+  assert.equal(findAll(render(), node => node.children?.[0] === t('snapshots.restoring')).length, 0)
+})
+
+test('opening the panel asks for the one check that may act, and never through a GET', async () => {
+  const hooks = fakeHooks()
+  const client = await loadClient(hooks.react)
+  const view = { installed: '0.4.0', channels: [], versions: [], task: { state: 'idle', log: '' } }
+  const network = fakeFetch({
+    // `/check/auto` first: the stub matches by suffix, and `/check` is a suffix
+    // of nothing but itself — but the acting path has to win the lookup.
+    '/check/auto': () => json({ result: view }),
+    '/check': () => json({ result: view }),
+    '/snapshots': () => json({ result: { snapshots: [] } }),
+    '/operations': () => json({ result: { events: [] } }),
+    '/policy': () => json({ result: { policy: {} } }),
+  })
+  network.install()
+  const controller = client.createController({ t })
+  hooks.render(client.VersionUpdateSection, {
+    t, ...controller.inject(),
+    useVersionUpdate: selector => selector(controller.getSnapshot()),
+  })
+  await flush()
+  // With a silent `mode: 'auto'` and no `checkAt`, this mount is the only
+  // moment the automatic decision ever runs — so it has to be the acting read,
+  // and it has to be a POST. As a GET it was reachable by a prefetch, a second
+  // tab, or any local process walking the route family, all of which could
+  // start a full tree replacement without anyone asking.
+  assert.equal(network.hit('POST', '/check/auto'), 1, 'the mount is the trigger the policy gets')
+  assert.equal(network.hit('GET', '/check'), 0, 'a GET is never the read that can install')
+})
+
+test('a settled rollback refreshes by observing, so it cannot undo itself', async () => {
+  const client = await loadClient()
+  const view = { installed: '0.3.0', channels: [], versions: [], task: { state: 'idle', log: '' } }
+  const network = fakeFetch({
+    '/snapshots': () => json({ result: { snapshots: [{ version: '0.3.0', usable: true }] } }),
+    '/check/run': () => json({ result: view }),
+    '/check': () => json({ result: view }),
+    '/operations': () => json({ result: { events: [] } }),
+    '/policy': () => json({ result: { policy: {} } }),
+    '/restore': () => json({ result: { ok: true, task: { state: 'idle', log: '' } } }),
+  })
+  network.install()
+  const controller = client.createController({ t })
+  await controller.check()
+  controller.requestRestore('0.3.0')
+  await controller.confirmRestore()
+  await flush()
+  // The follow-up read used to be the bare one, which feeds the automatic
+  // decision — so under `mode: 'auto'` a rollback installed the version the
+  // user had just rolled away from, seconds after the restore reported success.
+  assert.equal(network.hit('POST', '/check/run'), 1, 'the rollback refresh observes rather than acts')
+  assert.equal(network.hit('GET', '/check'), 1, 'and the only bare read is the one before it')
+})
