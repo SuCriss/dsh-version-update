@@ -42,11 +42,28 @@ test('save then load round-trips the exact policy', (t) => {
     mode: 'auto',
     track: { kind: 'line', range: '~0.4.0' },
     window: { start: '22:00', end: '06:00' },
-    restart: 'auto',
     checkAt: '04:30',
   }
   savePolicy(path, policy)
   assert.deepEqual(loadPolicy(path), policy)
+})
+
+test('a `restart` key written by an older version is ignored, not repaired into the shape', (t) => {
+  // The field used to select between "ask me" and "restart unattended". It is
+  // not a policy any more — restarting is always the panel's button — so an
+  // upgraded install must load its own file without the key and without an
+  // error, and the value must never come back out.
+  const path = seededPolicyPath(t)
+  writeFileSync(path, JSON.stringify({
+    mode: 'auto',
+    track: { kind: 'tag', tag: 'next' },
+    window: null,
+    restart: 'auto',
+    checkAt: null,
+  }))
+  const loaded = loadPolicy(path)
+  assert.equal(Object.hasOwn(loaded, 'restart'), false)
+  assert.deepEqual(loaded, { mode: 'auto', track: { kind: 'tag', tag: 'next' }, window: null, checkAt: null })
 })
 
 test('a corrupted file degrades to defaults instead of throwing', (t) => {
@@ -61,13 +78,11 @@ test('damaged fields fall back individually; healthy ones survive the repair', (
     mode: 'notify',
     track: { kind: 'tag', tag: 'next' },
     window: { start: 'oops' },
-    restart: 'sometimes',
     checkAt: '05:15',
   }))
   const loaded = loadPolicy(path)
   assert.equal(loaded.mode, 'notify')
   assert.deepEqual(loaded.track, { kind: 'tag', tag: 'next' })
   assert.equal(loaded.window, null)
-  assert.equal(loaded.restart, 'ask')
   assert.equal(loaded.checkAt, '05:15')
 })

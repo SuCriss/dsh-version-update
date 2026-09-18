@@ -59,6 +59,42 @@ test('matchesLine implements caret and tilde over stable versions only', () => {
   assert.equal(matchesLine('0.4.0', '0.4.x'), false)
 })
 
+test('matchesLine enforces the caret lower bound at every zero position', () => {
+  // Below the anchored version never matches, whatever the line shape.
+  assert.equal(matchesLine('1.1.0', '^1.5.0'), false, '1.1.0 < ^1.5.0')
+  assert.equal(matchesLine('1.5.0', '^1.5.0'), true, 'the anchor itself is the inclusive lower bound')
+  assert.equal(matchesLine('0.0.2', '^0.0.3'), false, '0.0.2 < ^0.0.3')
+  assert.equal(matchesLine('0.0.3', '^0.0.3'), true)
+  assert.equal(matchesLine('0.3.9', '^0.4.0'), false)
+  assert.equal(matchesLine('1.5.2', '^1.5.3'), false)
+  assert.equal(matchesLine('1.6.0', '^1.5.3'), true, 'higher minor can reset the patch')
+  assert.equal(matchesLine('0.4.2', '^0.4.3'), false)
+  assert.equal(matchesLine('0.4.3', '^0.4.3'), true)
+  assert.equal(matchesLine('0.4.0', '~0.4.1'), false, 'tilde has the same lower bound')
+  assert.equal(matchesLine('0.4.1', '~0.4.1'), true)
+  assert.equal(matchesLine('1.2.2', '~1.2.3'), false)
+})
+
+test('matchesLine enforces the caret and tilde upper bounds at every zero position', () => {
+  // ^x.y.z → [x.y.z, (x+1).0.0)
+  assert.equal(matchesLine('1.9.9', '^1.5.0'), true)
+  assert.equal(matchesLine('2.0.0', '^1.5.0'), false)
+  // ^0.y.z → [0.y.z, 0.(y+1).0)
+  assert.equal(matchesLine('0.4.99', '^0.4.0'), true)
+  assert.equal(matchesLine('0.5.0', '^0.4.0'), false)
+  // ^0.0.z → [0.0.z, 0.0.(z+1)) — only that exact stable patch.
+  assert.equal(matchesLine('0.0.3', '^0.0.3'), true)
+  assert.equal(matchesLine('0.0.4', '^0.0.3'), false, '0.0.4 > ^0.0.3')
+  assert.equal(matchesLine('0.1.0', '^0.0.3'), false)
+  assert.equal(matchesLine('0.0.0', '^0.0.0'), true)
+  assert.equal(matchesLine('0.0.1', '^0.0.0'), false)
+  // Tilde never crosses the minor: [x.y.z, x.(y+1).0)
+  assert.equal(matchesLine('1.4.99', '~1.4.0'), true)
+  assert.equal(matchesLine('1.5.0', '~1.4.0'), false)
+  assert.equal(matchesLine('0.0.4', '~0.0.3'), true, 'tilde at 0.0 still spans the patch')
+  assert.equal(matchesLine('0.1.0', '~0.0.3'), false)
+})
+
 test('resolveTarget resolves tags and lines; pins and unknown installs resolve to nothing', () => {
   const published = {
     distTags: { latest: '0.4.0', next: '0.5.0-rc.1' },

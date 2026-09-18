@@ -52,9 +52,9 @@ function harness(overrides = {}) {
   const started = []
   const updater = {
     view: () => overrides.taskView?.() ?? { state: 'idle', log: '' },
-    start: (version, trigger) => {
+    start: (version, trigger, options) => {
       if ((overrides.busy?.()) === true) throw new Error('an update is already running')
-      started.push({ version, trigger })
+      started.push({ version, trigger, options })
       return { state: 'running', version, log: '' }
     },
   }
@@ -85,9 +85,12 @@ test('the full route family registers; optional routes appear only when wired', 
   const full = harness({
     deps: {
       restarter: { restart: () => ({}) },
+      restartLogPath: join(tmpdir(), 'vu-no-restart.log'),
+      preflight: async () => ({ npm: { available: false }, installDirWritable: false, diskFreeBytes: null, snapshotDirUsable: false, warnings: ['unavailable'], ok: false }),
       notes: async () => ({}),
       repoSlug: 'o/r',
       policy: { get: () => DEFAULT_POLICY, set: () => {} },
+      pendingCancel: () => {},
       snapshots: { list: () => [], restore: () => ({ ok: true }), remove: () => ({ ok: true }) },
     },
   })
@@ -99,7 +102,7 @@ test('the full route family registers; optional routes appear only when wired', 
   // only notes/policy/snapshots appear when their operations are wired.
   const bare = harness()
   assert.deepEqual(bare.routes.map(r => r.path).sort(), [
-    VERSION_API.check, VERSION_API.restart, VERSION_API.restartCancel, VERSION_API.status, VERSION_API.update,
+    VERSION_API.check, VERSION_API.checkRun, VERSION_API.operations, VERSION_API.restart, VERSION_API.status, VERSION_API.update,
   ])
 })
 
@@ -107,6 +110,58 @@ test('the loopback fence answers 403 before touching any handler', async () => {
   const { routes } = harness()
   const res = await invoke(routes, VERSION_API.check, { fenced: false })
   assert.equal(res.status, 403)
+})
+
+test('pending cancellation is POST-only, loopback-fenced, and idempotent', async () => {
+  let cancelled = 0
+  const { routes } = harness({ deps: { pendingCancel: () => { cancelled += 1 } } })
+  for (const method of ['GET', 'PUT', 'DELETE', 'HEAD']) {
+    assert.equal((await invoke(routes, VERSION_API.pendingCancel, { method })).status, 405)
+  }
+  assert.equal((await invoke(routes, VERSION_API.pendingCancel, { method: 'POST', fenced: false })).status, 403)
+  assert.equal(cancelled, 0)
+  for (let i = 0; i < 2; i += 1) {
+    const res = await invoke(routes, VERSION_API.pendingCancel, { method: 'POST' })
+    assert.equal(res.status, 200)
+    assert.deepEqual(res.body, { result: { cancelled: true } })
+  }
+  assert.equal(cancelled, 2)
+  assert.equal(harness().routes.some(route => route.path === VERSION_API.pendingCancel), false)
+})
+
+test('preflight is GET-only and fenced before probes, with advisory failures in result', async () => {
+  let calls = 0
+  const verdict = { npm: { available: false }, installDirWritable: true, diskFreeBytes: null, snapshotDirUsable: true, warnings: ['npm missing'], ok: false }
+  const { routes, started } = harness({ deps: { preflight: async () => { calls += 1; return verdict } } })
+  assert.equal((await invoke(routes, VERSION_API.preflight, { method: 'POST' })).status, 405)
+  assert.equal((await invoke(routes, VERSION_API.preflight, { fenced: false })).status, 403)
+  assert.equal(calls, 0)
+  const res = await invoke(routes, VERSION_API.preflight)
+  assert.equal(res.status, 200)
+  assert.deepEqual(res.body.result, verdict)
+  assert.equal(calls, 1)
+  assert.deepEqual(started, [])
+})
+
+test('operations is always mounted, GET-only, fenced, and filters the polling cursor', async () => {
+  const seen = []
+  const tail = { events: [{ id: 1, kind: 'install', phase: 'done', seq: 3, at: 1 }], cursor: 3 }
+  const { routes } = harness({ deps: { operations: { list: since => { seen.push(since); return tail } } } })
+  for (const method of ['POST', 'PUT', 'DELETE', 'HEAD']) {
+    assert.equal((await invoke(routes, VERSION_API.operations, { method })).status, 405)
+  }
+  assert.equal((await invoke(routes, VERSION_API.operations, { fenced: false })).status, 403)
+  assert.deepEqual(seen, [], 'the fence runs before reading events')
+  const res = await invoke(routes, VERSION_API.operations, { query: '?since=2' })
+  assert.equal(res.status, 200)
+  assert.deepEqual(res.body, { result: tail })
+  assert.deepEqual(seen, [2])
+  for (const query of ['?since=-1', '?since=no', '?since=Infinity', '?since=9999999999999999999']) {
+    await invoke(routes, VERSION_API.operations, { query })
+    assert.equal(seen.at(-1), undefined, 'malformed cursors request the retained tail')
+  }
+  const empty = await invoke(harness().routes, VERSION_API.operations)
+  assert.deepEqual(empty.body, { result: { events: [], cursor: 0 } })
 })
 
 test('wrong methods are refused with 405', async () => {
@@ -239,6 +294,55 @@ test('a throwing auto decision cannot fail the panel check', async () => {
   assert.equal(res.body.result.installed, '0.4.0')
 })
 
+test('manual check is POST-only, fenced, and never invokes automation', async () => {
+  let manualCalls = 0
+  let autoCalls = 0
+  const { routes, started } = harness({ deps: {
+    fetchImpl: async () => ({ ok: true, json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {} } }) }),
+    auto: async () => { autoCalls += 1 },
+    manualCheck: async (published) => {
+      manualCalls += 1
+      assert.equal(published.distTags.latest, '0.5.0')
+      return { manual: true }
+    },
+  } })
+  assert.equal((await invoke(routes, VERSION_API.checkRun)).status, 405)
+  assert.equal((await invoke(routes, VERSION_API.checkRun, { method: 'POST', fenced: false })).status, 403)
+  const res = await invoke(routes, VERSION_API.checkRun, { method: 'POST' })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.manual, true)
+  assert.equal(res.body.result.installed, '0.4.0')
+  assert.equal(manualCalls, 1)
+  assert.equal(autoCalls, 0)
+  assert.deepEqual(started, [])
+})
+
+test('manual check keeps registry facts when its decision fails', async () => {
+  const { routes } = harness({ deps: {
+    fetchImpl: async () => ({ ok: true, json: async () => ({ 'dist-tags': { latest: '0.5.0' }, versions: { '0.5.0': {} } }) }),
+    manualCheck: async () => { throw new Error('decision failed') },
+    auto: async () => { assert.fail('manual checks must never fall back to auto') },
+  } })
+  const res = await invoke(routes, VERSION_API.checkRun, { method: 'POST' })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.channels[0].version, '0.5.0')
+})
+
+test('restart diagnostics reads only the configured path and requires restart wiring', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vu-diagnostics-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const restartLogPath = join(dir, 'restart.log')
+  writeFileSync(restartLogPath, 'handoff ready token=private\n')
+  const { routes } = harness({ deps: { restartLogPath, restarter: { restart: () => ({}) } } })
+  const res = await invoke(routes, VERSION_API.restartDiagnostics, { query: '?path=ignored' })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.available, true)
+  assert.match(res.body.result.log, /handoff ready token=\[redacted\]/)
+  assert.equal((await invoke(routes, VERSION_API.restartDiagnostics, { method: 'POST' })).status, 405)
+  assert.equal((await invoke(routes, VERSION_API.restartDiagnostics, { fenced: false })).status, 403)
+  assert.equal(harness({ deps: { restartLogPath } }).routes.some(route => route.path === VERSION_API.restartDiagnostics), false)
+})
+
 test('update validates the target and always records manual trigger', async () => {
   const { routes, started } = harness()
   const bad = await invoke(routes, VERSION_API.update, { method: 'POST', body: { version: '^1.0.0' } })
@@ -246,7 +350,27 @@ test('update validates the target and always records manual trigger', async () =
 
   const good = await invoke(routes, VERSION_API.update, { method: 'POST', body: { version: '0.5.0' } })
   assert.equal(good.status, 200)
-  assert.deepEqual(started, [{ version: '0.5.0', trigger: 'manual' }])
+  assert.deepEqual(started, [{ version: '0.5.0', trigger: 'manual', options: {} }])
+})
+
+test('update forwards a named download source and refuses anything else', async () => {
+  const { routes, started } = harness()
+  // The body names a SOURCE, never a registry: a URL here is a request trying
+  // to steer npm's command line, and it is refused rather than ignored.
+  const refused = await invoke(routes, VERSION_API.update, {
+    method: 'POST',
+    body: { version: '0.5.0', source: 'https://evil.test' },
+  })
+  assert.equal(refused.status, 400)
+  assert.match(refused.body.error, /source must be one of/)
+  assert.deepEqual(started, [], 'a refused source never starts an install')
+
+  const mirrored = await invoke(routes, VERSION_API.update, {
+    method: 'POST',
+    body: { version: '0.5.0', source: 'mirror' },
+  })
+  assert.equal(mirrored.status, 200)
+  assert.deepEqual(started, [{ version: '0.5.0', trigger: 'manual', options: { source: 'mirror' } }])
 })
 
 test('update reports a busy runner as 409', async () => {
@@ -490,17 +614,11 @@ test('an async restore is awaited, and a contended lock answers 409 not 500', as
   assert.match(refused.body.error, /machine-wide update lock/)
 })
 
-test('the restart cancel is a POST-only route, and the panel defers with POST', async () => {
-  let cancelled = 0
-  const { routes } = harness({ deps: { restarter: { restart: () => ({}), cancelPending: () => { cancelled += 1 } } } })
-  // The browser half can only disarm the host fallback through POST: a deferral
-  // that reaches this route as a GET answers 405, is swallowed by the caller's
-  // catch, and the host restarts anyway out from under a page that said later.
-  const wrong = await invoke(routes, VERSION_API.restartCancel, { method: 'GET' })
-  assert.equal(wrong.status, 405)
-  assert.equal(cancelled, 0, 'a refused method must not disarm anything')
-  const right = await invoke(routes, VERSION_API.restartCancel, { method: 'POST' })
-  assert.equal(right.status, 200)
-  assert.deepEqual(right.body.result, { cancelled: true })
-  assert.equal(cancelled, 1)
+test('nothing arms a host-side restart any more, so no cancel route is mounted', async () => {
+  // `restart/cancel` existed to disarm the timed fallback the auto-restart
+  // policy armed. That fallback is gone, so the route is gone with it: a
+  // request to it is an unknown path, not a silent no-op that a stale page
+  // could mistake for having deferred something.
+  const { routes } = harness({ deps: { restarter: { restart: () => ({}) } } })
+  assert.equal(routes.some(route => route.path === '/api/dsh-version-update/restart/cancel'), false)
 })

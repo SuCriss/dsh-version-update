@@ -7,13 +7,13 @@
 
 import assert from 'node:assert/strict'
 import { after, test } from 'node:test'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { mkdtemp } from 'node:fs/promises'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { createUpdater, resolveNpmCli } from '../lib/updater.js'
-import { readLockHolder } from '../lib/updatelock.js'
+import { acquireUpdateLock, readLockHolder } from '../lib/updatelock.js'
 
 /**
  * The lock file every runner in this file contends on. The suite must never
@@ -382,7 +382,7 @@ test('a refused start never leaves the machine-wide lock behind', async (t) => {
   assert.equal(existsSync(lockPath), false, 'a settled run releases the lock')
 })
 
-test('an orphaned run settling late cannot unlock the newer run', async (t) => {
+test('a replacement waits for the orphan lock to release on close', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'vu-orphan-'))
   const lockPath = join(dir, 'update.lock')
   t.after(() => rmSync(dir, { recursive: true, force: true }))
@@ -392,17 +392,19 @@ test('an orphaned run settling late cannot unlock the newer run', async (t) => {
   const orphan = spawnA.calls[0].child
   // A config reload disposes the fiber but deliberately leaves npm alive.
   first.dispose()
-  // The orphan has exited — which is what releases the process-wide slot — but
-  // has not reported its close yet, so its settlement still lands LATER, after
-  // a newer run has claimed the slot and the lock.
+  // The child has exited but its host PID is still alive and owns the lock
+  // until close settles the run. A replacement must not steal that lock.
   orphan.exitCode = 0
   const spawnB = spawnStub()
   const second = createUpdater({ spawnImpl: spawnB, npmCli: '/n', lockPath })
   t.after(() => second.dispose())
-  assert.equal(second.start('1.1.0').state, 'running')
+  assert.throws(() => second.start('1.1.0'), /machine-wide update lock/)
+  assert.equal(spawnB.calls.length, 0)
 
   orphan.emit('close', 0)
   await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(second.start('1.1.0').state, 'running')
+  orphan.emit('close', 0) // a duplicate old settlement cannot release the new token
 
   assert.equal(existsSync(lockPath), true, 'the live run keeps its lock after an orphan settles')
   assert.equal(readLockHolder(readFileSync(lockPath, 'utf8'))?.pid, process.pid, 'still OUR lock')
@@ -434,3 +436,220 @@ test('the retained log tail respects LOG_LIMIT', async (t) => {
   assert.ok(logText.length <= LOG_LIMIT)
   assert.ok(logText.includes('TAIL'), 'the newest output survives the cap')
 })
+
+/** Let one extraction-watcher tick run, plus a margin. */
+const settleTick = () => new Promise(resolve => setTimeout(resolve, 25))
+
+/**
+ * Wait for a progress observation to appear. The watcher is timer-driven, so a
+ * fixed sleep would either flake or slow the suite down; this waits on the fact
+ * being asserted instead.
+ * @param {() => boolean} done - whether the awaited state has arrived.
+ * @param {string} description - what was awaited, for the failure message.
+ * @param {number} [timeoutMs] - how long to keep polling.
+ */
+async function waitForProgress(done, description, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (done()) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  assert.fail(`the progress model never reached: ${description}`)
+}
+
+test('the task reports a phase, a percentage, and a stall it can actually see', async (t) => {
+  const { INSTALL_PROGRESS_STEP } = await import('../lib/updater.js')
+  const home = await mkdtemp(join(tmpdir(), 'vu-progress-'))
+  // A tree big enough that removing it reads as the mid-reify reset the
+  // watcher keys on, plus the two files post-install verification needs.
+  const blob = join(home, 'blob.bin')
+  await writeFile(blob, Buffer.alloc(INSTALL_PROGRESS_STEP + 1024 * 1024))
+  await mkdir(join(home, 'lib'), { recursive: true })
+  await writeFile(join(home, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '1.2.3' }))
+  await writeFile(join(home, 'lib', 'bin.js'), '// launcher\n')
+
+  const spawn = spawnStub()
+  const updater = createUpdater({
+    spawnImpl: spawn,
+    npmCli: '/n',
+    lockPath: FILE_LOCK,
+    installDir: home,
+    progressMs: 60,
+    slowAfterMs: 40,
+    // The snapshot copy reports bytes against a measured total; that total is
+    // also the denominator the extraction phase inherits. The delay stands in
+    // for the real hook's own measurement pass, so start() answers while the
+    // run is still in its first phase.
+    beforeSpawn: async (version, report, progress) => {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      report('snapshot: 25% 50.0 MB copied\n')
+      progress({ phase: 'snapshot', bytes: 50, totalBytes: 200, files: 3 })
+    },
+  })
+  t.after(async () => {
+    // A test that fails mid-run must not leave the process-wide slot claimed:
+    // every later test in this file would then be refused for it.
+    for (const call of spawn.calls) {
+      if (call.child.exitCode === null && call.child.signalCode === null) {
+        call.child.exitCode = 0
+        call.child.emit('close', 0)
+      }
+    }
+    updater.dispose()
+    await rm(home, { recursive: true, force: true })
+  })
+
+  const started = updater.start('1.2.3')
+  assert.equal(started.progress.phase, 'preparing', 'the bar exists from the first second')
+  assert.equal(started.progress.percent, undefined, 'nothing has been measured yet')
+  assert.equal(started.progress.slow, false)
+
+  // The snapshot copy: the one phase with a denominator it measured itself.
+  await new Promise(resolve => setTimeout(resolve, 15))
+  const snapshotPhase = updater.view().progress
+  assert.equal(snapshotPhase.phase, 'snapshot')
+  assert.equal(snapshotPhase.percent, 25, 'a phase with a real denominator reports a real percentage')
+  assert.equal(snapshotPhase.totalBytes, 200)
+
+  // npm is running and the tree has not moved: the run is downloading, and
+  // with no cache probe wired the phase is honest about having no numerator —
+  // in particular it does NOT keep reporting the snapshot's percentage.
+  await waitForProgress(() => updater.view().progress.phase === 'download', 'the download phase')
+  assert.equal(spawn.calls.length, 1)
+  const download = updater.view().progress
+  assert.equal(download.percent, undefined)
+  assert.equal(download.totalBytes, undefined)
+  assert.equal(download.indeterminate, true)
+
+  // The tree shrinks — the mid-reify reset — and extraction begins against the
+  // size the snapshot recorded. What remains on disk is the manifest and the
+  // launcher, so the climb starts from a few bytes rather than from zero.
+  await rm(blob)
+  await waitForProgress(() => updater.view().progress.phase === 'extract', 'the extract phase')
+  const reset = updater.view().progress
+  assert.equal(reset.totalBytes, 200, 'the snapshot total becomes the extraction denominator')
+  assert.ok(reset.percent < 50, `the reset starts the climb over (saw ${reset.percent}%)`)
+
+  // Growth inside the tree is reported as a percentage, not as a log line.
+  await writeFile(blob, Buffer.alloc(100))
+  await waitForProgress(() => updater.view().progress.bytes > reset.bytes, 'the extraction to grow')
+  const grown = updater.view().progress
+  assert.equal(grown.phase, 'extract')
+  assert.ok(grown.percent > reset.percent, 'the bar moves forward as the tree grows')
+
+  // Nothing has moved since, and this phase IS observable — so the run says so.
+  await new Promise(resolve => setTimeout(resolve, 80))
+  const stalled = updater.view().progress
+  assert.equal(stalled.slow, true, 'a measured phase with no movement reports itself slow')
+  assert.ok(stalled.stalledMs >= 40)
+
+  spawn.calls[0].child.exitCode = 0
+  spawn.calls[0].child.emit('close', 0)
+  await Promise.resolve()
+  const done = updater.view()
+  assert.equal(done.state, 'done')
+  assert.equal(done.progress.phase, 'done')
+  assert.equal(done.progress.percent, 100, 'a settled run is complete whatever the last sample said')
+  assert.equal(done.progress.slow, false, 'a settled run cannot be slow')
+})
+
+test('an install can be pinned to a named source, and only to a known one', async (t) => {
+  const { DEFAULT_MIRROR_REGISTRY } = await import('../lib/updater.js')
+  const spawn = spawnStub()
+  /**
+   * Settle the install that was just spawned, so the process-wide slot frees.
+   * @returns {Promise<string[]>} the npm arguments it was spawned with.
+   */
+  const finish = async () => {
+    const call = spawn.calls.at(-1)
+    assert.ok(call !== undefined, 'an install was spawned')
+    call.child.exitCode = 0
+    call.child.emit('close', 0)
+    await Promise.resolve()
+    return call.args
+  }
+  const updater = createUpdater({
+    spawnImpl: spawn,
+    npmCli: '/npm/cli.js',
+    lockPath: FILE_LOCK,
+    registry: 'https://registry.internal',
+    servedRegistry: () => 'https://registry.served',
+  })
+  t.after(() => updater.dispose())
+
+  // The default stays what it always was: the source the versions came from.
+  const automatic = updater.start('1.0.0', 'manual')
+  assert.equal(automatic.source, 'auto')
+  assert.equal(automatic.registry, 'https://registry.served')
+  assert.deepEqual((await finish()).slice(-2), ['--registry', 'https://registry.served'])
+
+  // The mirror is the escape hatch a slow source sends a user looking for.
+  const mirrored = updater.start('1.0.1', 'manual', { source: 'mirror' })
+  assert.equal(mirrored.source, 'mirror')
+  assert.equal(mirrored.registry, DEFAULT_MIRROR_REGISTRY)
+  assert.deepEqual((await finish()).slice(-2), ['--registry', DEFAULT_MIRROR_REGISTRY])
+
+  // ...and the configured registry can be pinned explicitly, mirror or not.
+  updater.start('1.0.2', 'manual', { source: 'official' })
+  assert.deepEqual((await finish()).slice(-2), ['--registry', 'https://registry.internal'])
+
+  // A source the runner does not know is refused, never passed through: the
+  // URL behind a source is host-side config, and no request names one.
+  assert.throws(() => updater.start('1.0.3', 'manual', { source: 'https://evil.test' }), /unknown install source/)
+  assert.throws(() => updater.start('1.0.3', 'manual', { source: 'mirror ' }), /unknown install source/)
+  assert.equal(spawn.calls.length, 3, 'a refused source never spawns')
+})
+
+test('a fatal preparation failure stops the install before npm runs', async (t) => {
+  const { FatalPreparationError } = await import('../lib/updater.js')
+  const spawn = spawnStub()
+  const settled = []
+  const updater = createUpdater({
+    spawnImpl: spawn,
+    npmCli: '/n',
+    lockPath: FILE_LOCK,
+    onSettled: info => settled.push(info),
+    beforeSpawn: async () => { throw new FatalPreparationError('rollback snapshot unavailable: disk full') },
+  })
+  t.after(() => updater.dispose())
+
+  updater.start('3.3.3')
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(spawn.calls.length, 0, 'npm must not touch a tree that has no way back')
+  const view = updater.view()
+  assert.equal(view.state, 'failed')
+  assert.match(view.error, /rollback snapshot unavailable/)
+  assert.match(view.log, /preparation refused the install/)
+  assert.deepEqual(settled, [{ version: '3.3.3', ok: false, trigger: 'manual' }])
+
+  // The refusal released the slot, the preparation claim, and the machine-wide
+  // lock: the user's next attempt is not refused for a run that never happened.
+  const retry = createUpdater({ spawnImpl: spawn, npmCli: '/n', lockPath: FILE_LOCK })
+  t.after(() => retry.dispose())
+  retry.start('3.3.4')
+  assert.equal(spawn.calls.length, 1, 'the machine-wide lock was released')
+  spawn.calls[0].child.exitCode = 0
+  spawn.calls[0].child.emit('close', 0)
+  await Promise.resolve()
+})
+
+test('resolveNpmScratch follows npm\'s own cache resolution', async () => {
+  const { resolveNpmScratch } = await import('../lib/updater.js')
+  assert.equal(resolveNpmScratch({ env: {} }), undefined, 'no cache anywhere means no download signal')
+  assert.equal(
+    resolveNpmScratch({ env: { npm_config_cache: '/cache' } }),
+    join('/cache', '_cacache', 'tmp'),
+    'an explicit cache wins, whether or not it exists yet',
+  )
+  assert.equal(
+    resolveNpmScratch({ env: { HOME: '/home/me' } }),
+    join('/home/me', '.npm', '_cacache', 'tmp'),
+    'the POSIX per-user default is npm\'s own',
+  )
+  assert.equal(
+    resolveNpmScratch({ env: { LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local' } }),
+    join('C:\\Users\\me\\AppData\\Local', 'npm-cache', '_cacache', 'tmp'),
+    'the Windows per-user default is npm\'s own',
+  )
+})
+

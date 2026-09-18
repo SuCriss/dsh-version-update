@@ -68,14 +68,13 @@ test('nextOccurrence returns today when the time has not passed, tomorrow when i
 
 test('normalizePolicy patches: absent fields keep the base policy', () => {
   const base = { ...DEFAULT_POLICY, mode: 'auto', window: { start: '22:00', end: '06:00' } }
-  const outcome = normalizePolicy({ restart: 'auto' }, base)
+  const outcome = normalizePolicy({ checkAt: '03:00' }, base)
   assert.equal(outcome.ok, true)
   assert.deepEqual(outcome.value, {
     mode: 'auto',
     track: DEFAULT_POLICY.track,
     window: { start: '22:00', end: '06:00' },
-    restart: 'auto',
-    checkAt: null,
+    checkAt: '03:00',
   })
 })
 
@@ -92,7 +91,6 @@ test('normalizePolicy rejects each field by name and keeps the base value', () =
     { window: { start: '25:00', end: '06:00' } },
     { window: { start: '04:00' } },
     { window: '04:00-05:00' },
-    { restart: 'maybe' },
     { checkAt: '4pm' },
     { checkAt: 420 },
   ]
@@ -110,11 +108,16 @@ test('normalizePolicy falls back to the base mode like every other field group',
   // mode used to be the one field group that left the normalized value with
   // `mode: undefined` instead of the base value.
   const base = { ...DEFAULT_POLICY, mode: 'auto' }
-  const outcome = normalizePolicy({ mode: 'sometimes' }, base)
-  assert.equal(outcome.ok, false)
-  assert.deepEqual(outcome.issues, ['mode must be one of off, notify, auto'])
-  assert.equal(outcome.value.mode, 'auto', 'a rejected mode keeps the base mode')
-  assert.deepEqual(outcome.value, base)
+  for (const mode of ['sometimes', '', false, 42, {}, []]) {
+    const outcome = normalizePolicy({ mode }, base)
+    assert.equal(outcome.ok, false, JSON.stringify(mode))
+    assert.deepEqual(outcome.issues, ['mode must be one of off, notify, auto'])
+    assert.equal(outcome.value.mode, 'auto', 'a rejected mode keeps the base mode')
+    assert.deepEqual(outcome.value, base)
+  }
+  const patched = normalizePolicy({ mode: 'sometimes', checkAt: '03:00' }, base)
+  assert.equal(patched.ok, false)
+  assert.deepEqual(patched.value, { ...base, checkAt: '03:00' }, 'valid fields still apply')
 })
 
 test('normalizePolicy ignores unknown keys and normalizes the whole shape', () => {
@@ -122,14 +125,15 @@ test('normalizePolicy ignores unknown keys and normalizes the whole shape', () =
     mode: 'notify',
     track: { kind: 'pin' },
     window: null,
-    restart: 'ask',
     checkAt: null,
-    // Unknown keys are forward-compatible: a hand-edited file may carry them.
+    // Unknown keys are forward-compatible: a hand-edited file may carry them,
+    // including `restart`, which older versions wrote and nothing reads now.
+    restart: 'auto',
     nextCheckHint: 'soon',
     somethingElse: true,
   })
   assert.equal(outcome.ok, true)
-  assert.deepEqual(outcome.value, { mode: 'notify', track: { kind: 'pin' }, window: null, restart: 'ask', checkAt: null })
+  assert.deepEqual(outcome.value, { mode: 'notify', track: { kind: 'pin' }, window: null, checkAt: null })
 })
 
 test('normalizePolicy accepts every kind of tracking rule', () => {
@@ -152,7 +156,6 @@ test('repairPolicy always yields a usable policy, field by field', () => {
     mode: 'wat',
     track: { kind: 'tag', tag: 'has space' },
     window: { start: 'nope' },
-    restart: 'maybe',
     checkAt: 'not-a-time',
     legacy: true,
   })
@@ -165,5 +168,5 @@ test('the wire contract: route paths, release tag candidates, the frozen default
     assert.match(path, /^\/api\/dsh-version-update\//)
   }
   assert.deepEqual(releaseTagCandidates('1.2.3'), ['dsh-v1.2.3', 'v1.2.3'])
-  assert.deepEqual(DEFAULT_POLICY, { mode: 'off', track: { kind: 'tag', tag: 'latest' }, window: null, restart: 'ask', checkAt: null })
+  assert.deepEqual(DEFAULT_POLICY, { mode: 'off', track: { kind: 'tag', tag: 'latest' }, window: null, checkAt: null })
 })

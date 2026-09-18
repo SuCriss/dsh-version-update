@@ -137,17 +137,71 @@ test('the freshness guard leaves young retirements alone on the boot path', () =
   }
 })
 
-test('a healthy tree needs no repair', () => {
+test('a healthy tree needs no repair', (t) => {
   const base = mkdtempSync(join(tmpdir(), 'dsh-vu-healthy-'))
-  try {
-    const installDir = join(base, 'dsh')
-    mkdirSync(join(installDir, 'node_modules'), { recursive: true })
-    writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '3.0.0' }))
-    const outcome = repairTree({ installDir, snapshotsDir: join(base, 'snapshots'), minAgeMs: 0 })
-    assert.equal(outcome.removed, 0)
-    assert.equal(outcome.restored, undefined)
-    assert.deepEqual(outcome.errors, [])
-  } finally {
-    rmSync(base, { recursive: true, force: true })
-  }
+  t.after(() => rmSync(base, { recursive: true, force: true }))
+  const installDir = join(base, 'dsh')
+  mkdirSync(join(installDir, 'node_modules'), { recursive: true })
+  mkdirSync(join(installDir, 'lib'), { recursive: true })
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '3.0.0' }))
+  writeFileSync(join(installDir, 'lib', 'bin.js'), '#!/usr/bin/env node\n')
+  const outcome = repairTree({ installDir, snapshotsDir: join(base, 'snapshots'), minAgeMs: 0 })
+  assert.equal(outcome.manifestOk, true)
+  assert.equal(outcome.launcherOk, true)
+  assert.equal(outcome.removed, 0)
+  assert.equal(outcome.restored, undefined)
+  assert.deepEqual(outcome.errors, [])
 })
+
+test('a missing launcher is repaired from a snapshot even with an intact manifest', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'dsh-vu-launcher-'))
+  t.after(() => rmSync(base, { recursive: true, force: true }))
+  const good = join(base, 'good')
+  mkdirSync(join(good, 'lib'), { recursive: true })
+  writeFileSync(join(good, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '1.2.3' }))
+  writeFileSync(join(good, 'lib', 'bin.js'), 'entry')
+  const snapshotsDir = join(base, 'snapshots')
+  assert.equal(createSnapshot({ installDir: good, snapshotsDir, version: '1.2.3' }).ok, true)
+
+  const installDir = join(base, 'dsh')
+  mkdirSync(installDir, { recursive: true })
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '1.2.3' }))
+  const outcome = repairTree({ installDir, snapshotsDir, minAgeMs: 0 })
+  assert.equal(outcome.restored, '1.2.3')
+  assert.equal(outcome.launcherOk, true)
+  assert.equal(existsSync(join(installDir, 'lib', 'bin.js')), true)
+})
+
+test('preferredVersion restores exactly that snapshot even when the tree looks healthy', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'dsh-vu-pref-'))
+  t.after(() => rmSync(base, { recursive: true, force: true }))
+  const build = (version) => {
+    const dir = join(base, `tree-${version}`)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version }))
+    return dir
+  }
+  const good12 = build('1.2.3')
+  const snapshotsDir = join(base, 'snapshots')
+  assert.equal(createSnapshot({ installDir: good12, snapshotsDir, version: '1.2.3', now: () => 10 }).ok, true)
+  const good20 = build('2.0.0')
+  assert.equal(createSnapshot({ installDir: good20, snapshotsDir, version: '2.0.0', now: () => 20 }).ok, true)
+
+  // The host wiring knows validation failed while 2.0.0 landed; repair must
+  // roll back to 1.2.3, not silently pick the newest snapshot.
+  const live = join(base, 'live')
+  mkdirSync(live, { recursive: true })
+  writeFileSync(join(live, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '2.0.0' }))
+  const outcome = repairTree({ installDir: live, snapshotsDir, preferredVersion: '1.2.3', minAgeMs: 0 })
+  assert.equal(outcome.restored, '1.2.3')
+  assert.equal(JSON.parse(readFileSync(join(live, 'package.json'), 'utf8')).version, '1.2.3')
+
+  // An unknown preferred version restores nothing rather than guessing.
+  const other = join(base, 'other')
+  mkdirSync(other, { recursive: true })
+  writeFileSync(join(other, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '2.0.0' }))
+  const refused = repairTree({ installDir: other, snapshotsDir, preferredVersion: '9.9.9', minAgeMs: 0 })
+  assert.equal(refused.restored, undefined)
+  assert.equal(JSON.parse(readFileSync(join(other, 'package.json'), 'utf8')).version, '2.0.0')
+  assert.ok(refused.errors.some(error => error.includes('9.9.9')))
+})

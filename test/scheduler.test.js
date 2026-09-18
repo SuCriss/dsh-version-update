@@ -45,21 +45,34 @@ function harness(overrides = {}) {
 /**
  * Replace the timer queue with a recording one: armed callbacks never fire on
  * their own, the test fires them by hand after moving the fake clock.
- * @returns {{ armed: { callback: () => void; ms: number }[]; restore: () => void }} the recorder.
+ * @returns {{ armed: { callback: () => void; ms: number; cleared: boolean }[]; restore: () => void }} the recorder.
  */
 function spyTimers() {
-  /** @type {{ callback: () => void; ms: number }[]} */
+  /** @type {{ callback: () => void; ms: number; cleared: boolean }[]} */
   const armed = []
   const original = globalThis.setTimeout
+  const originalClear = globalThis.clearTimeout
+  const handles = new Map()
+  globalThis.clearTimeout = /** @type {any} */ ((handle) => {
+    const entry = handles.get(handle)
+    if (entry !== undefined) entry.cleared = true
+    originalClear(handle)
+  })
   globalThis.setTimeout = /** @type {any} */ ((/** @type {Function} */ callback, /** @type {number} */ ms) => {
-    armed.push({ callback: () => callback(), ms })
+    const entry = { callback: () => callback(), ms, cleared: false }
+    armed.push(entry)
     // Unreffed on purpose: a far-future dummy must never hold the test process
     // open if a case forgets to dispose its scheduler.
     const dummy = original(() => {}, 10 ** 9)
     dummy.unref?.()
+    handles.set(dummy, entry)
     return dummy
   })
-  return { armed, restore: () => { globalThis.setTimeout = original } }
+  return { armed, restore: () => {
+    for (const handle of handles.keys()) originalClear(handle)
+    globalThis.setTimeout = original
+    globalThis.clearTimeout = originalClear
+  } }
 }
 
 test('mode off and notify record findings but never install', async () => {
@@ -296,4 +309,255 @@ test('consider decides from pre-fetched facts, so a check can trigger the instal
   assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }])
   assert.equal(scheduler.view().lastCheck.updateAvailable, true)
   assert.equal(scheduler.view().lastCheck.target, '0.5.0')
+})
+
+test('cancelPending clears window wakes and busy retries but keeps the daily check', async () => {
+  for (const busy of [false, true]) {
+    const spy = spyTimers()
+    let clock = new Date('2026-03-01T12:00:00')
+    const { state, scheduler } = harness({ now: () => clock })
+    state.policy = { ...DEFAULT_POLICY, mode: 'auto', checkAt: '13:00', window: busy ? null : { start: '04:00', end: '05:00' } }
+    state.refuse = busy
+    try {
+      scheduler.start()
+      const daily = spy.armed[0]
+      await scheduler.consider(PUBLISHED)
+      const wake = spy.armed.at(-1)
+      const before = scheduler.view()
+      assert.equal(before.pendingAuto?.target, '0.5.0')
+      scheduler.cancelPending()
+      scheduler.cancelPending() // Safe even when nothing is waiting.
+      assert.equal(scheduler.view().pendingAuto, undefined)
+      assert.equal(wake.cleared, true)
+      assert.equal(daily.cleared, false)
+      assert.equal(scheduler.view().nextCheckAt, before.nextCheckAt)
+      assert.deepEqual(scheduler.view().lastCheck, before.lastCheck)
+      state.refuse = false
+      clock = new Date('2026-03-02T04:00:00')
+      wake.callback() // A callback queued before cancellation is inert too.
+      assert.deepEqual(state.started, [])
+      assert.equal(spy.armed.length, 2)
+      // The daily timer still fires and re-arms; cancellation is not a policy edit.
+      daily.callback()
+      await new Promise(resolve => setImmediate(resolve))
+      assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }])
+      assert.equal(spy.armed.length, 3)
+    } finally { scheduler.dispose(); spy.restore() }
+  }
+})
+
+test('manual consider updates lastCheck without installing or parking', async () => {
+  const spy = spyTimers()
+  try {
+    for (const window of [null, { start: '04:00', end: '05:00' }]) {
+      const { state, scheduler } = harness()
+      state.policy = { ...DEFAULT_POLICY, mode: 'auto', window }
+      await scheduler.consider(PUBLISHED, { manual: true })
+      assert.deepEqual(state.started, [])
+      assert.equal(scheduler.view().pendingAuto, undefined)
+      assert.deepEqual(scheduler.view().lastCheck, {
+        at: new Date('2026-03-01T12:00:00').getTime(),
+        updateAvailable: true, target: '0.5.0', latest: '0.5.0',
+      })
+      scheduler.dispose()
+    }
+    assert.equal(spy.armed.length, 0)
+  } finally { spy.restore() }
+})
+
+test('manual consider leaves earlier automatic pending work unchanged', async () => {
+  const spy = spyTimers()
+  const { state, scheduler } = harness()
+  state.policy = { ...DEFAULT_POLICY, mode: 'auto', window: { start: '04:00', end: '05:00' } }
+  try {
+    await scheduler.consider(PUBLISHED)
+    const pending = scheduler.view().pendingAuto
+    const wake = spy.armed.at(-1)
+    await scheduler.consider({ distTags: { latest: '0.7.0' }, versions: ['0.7.0'] }, { manual: true })
+    assert.equal(scheduler.view().lastCheck.target, '0.7.0')
+    assert.deepEqual(scheduler.view().pendingAuto, pending)
+    assert.equal(spy.armed.at(-1), wake)
+    assert.equal(wake.cleared, false)
+    assert.deepEqual(state.started, [])
+  } finally { scheduler.dispose(); spy.restore() }
+})
+
+test('policyChanged clears pending and invalidates even already-queued wake callbacks', async () => {
+  const patches = [
+    { mode: 'off' }, { mode: 'notify' }, { track: { kind: 'pin' } },
+    { track: { kind: 'tag', tag: 'next' } }, { window: null }, { checkAt: '13:00' },
+  ]
+  for (const patch of patches) {
+    const spy = spyTimers()
+    const { state, scheduler } = harness()
+    state.policy = { ...DEFAULT_POLICY, mode: 'auto', window: { start: '04:00', end: '05:00' } }
+    try {
+      await scheduler.consider(PUBLISHED)
+      const wake = spy.armed.at(-1)
+      state.policy = { ...state.policy, ...patch }
+      scheduler.policyChanged()
+      assert.equal(scheduler.view().pendingAuto, undefined)
+      assert.equal(wake.cleared, true)
+      const count = spy.armed.length
+      wake.callback()
+      assert.equal(spy.armed.length, count, 'an invalidated callback cannot arm timers')
+      assert.deepEqual(state.started, [])
+    } finally { scheduler.dispose(); spy.restore() }
+  }
+})
+
+test('window and busy wakes revalidate mode, track, and installed version without policyChanged', async () => {
+  const changes = [
+    state => { state.policy.mode = 'off' },
+    state => { state.policy.mode = 'notify' },
+    state => { state.policy.track = { kind: 'pin' } },
+    state => { state.policy.track = { kind: 'tag', tag: 'next' } },
+    state => { state.policy.track = { kind: 'line', range: '^0.4.0' } },
+    state => { state.installed = '0.5.0' },
+    state => { state.installed = '0.7.0' },
+    state => { state.installed = undefined },
+  ]
+  for (const busy of [false, true]) for (const change of changes) {
+    let clock = new Date('2026-03-01T03:00:00')
+    const { state, scheduler } = harness({ now: () => clock })
+    state.policy = { ...DEFAULT_POLICY, mode: 'auto', window: busy ? null : { start: '04:00', end: '05:00' } }
+    state.refuse = busy
+    const spy = spyTimers()
+    try {
+      await scheduler.consider(PUBLISHED)
+      const wake = spy.armed.at(-1)
+      change(state)
+      state.refuse = false
+      clock = new Date('2026-03-01T04:00:00')
+      wake.callback()
+      assert.deepEqual(state.started, [])
+      assert.equal(scheduler.view().pendingAuto, undefined)
+      assert.equal(spy.armed.length, 1, 'a rejected finding does not retry forever')
+    } finally { scheduler.dispose(); spy.restore() }
+  }
+})
+
+test('new automatic facts clear an obsolete pending target and cancel its timer', async () => {
+  const { state, scheduler } = harness()
+  state.policy = { ...DEFAULT_POLICY, mode: 'auto', window: { start: '04:00', end: '05:00' } }
+  const spy = spyTimers()
+  try {
+    await scheduler.consider(PUBLISHED)
+    const wake = spy.armed.at(-1)
+    await scheduler.consider({ distTags: { latest: '0.4.2' }, versions: ['0.4.2'] })
+    assert.equal(scheduler.view().pendingAuto, undefined)
+    assert.equal(wake.cleared, true)
+    wake.callback()
+    assert.deepEqual(state.started, [])
+  } finally { scheduler.dispose(); spy.restore() }
+})
+
+test('parked facts are saved independently of caller mutations and kept out of the view', async () => {
+  let clock = new Date('2026-03-01T03:00:00')
+  const { state, scheduler } = harness({ now: () => clock })
+  state.policy = { ...DEFAULT_POLICY, mode: 'auto', window: { start: '04:00', end: '05:00' } }
+  const published = { distTags: { ...PUBLISHED.distTags }, versions: [...PUBLISHED.versions] }
+  const spy = spyTimers()
+  try {
+    await scheduler.consider(published)
+    assert.deepEqual(Object.keys(scheduler.view().pendingAuto), ['target', 'since'])
+    published.distTags.latest = '0.4.2'
+    published.versions.length = 0
+    clock = new Date('2026-03-01T04:00:00')
+    spy.armed.at(-1).callback()
+    assert.deepEqual(state.started, [{ version: '0.5.0', trigger: 'auto' }])
+  } finally { scheduler.dispose(); spy.restore() }
+})
+
+test('disposed registry generations cannot install, report errors, or re-arm after restart', async () => {
+  for (const restart of [false, true]) for (const fail of [false, true]) {
+    let settle
+    const check = new Promise((resolve, reject) => { settle = () => fail ? reject(new Error('late failure')) : resolve(PUBLISHED) })
+    const { state, scheduler } = harness({ check: () => check })
+    state.policy = { ...DEFAULT_POLICY, mode: 'auto', checkAt: '03:00' }
+    const spy = spyTimers()
+    try {
+      scheduler.start()
+      spy.armed[0].callback()
+      scheduler.dispose()
+      if (restart) scheduler.start()
+      const count = spy.armed.length
+      settle()
+      await new Promise(resolve => setImmediate(resolve))
+      assert.deepEqual(state.started, [])
+      assert.deepEqual(scheduler.view().lastCheck, {})
+      assert.equal(scheduler.view().pendingAuto, undefined)
+      assert.equal(spy.armed.length, count)
+      if (!restart) assert.equal(scheduler.view().nextCheckAt, undefined)
+    } finally { scheduler.dispose(); spy.restore() }
+  }
+})
+
+test('policyChanged invalidates in-flight registry decisions even if auto is re-enabled', async () => {
+  let finish
+  const { state, scheduler } = harness({ check: () => new Promise(resolve => { finish = resolve }) })
+  state.policy = { ...DEFAULT_POLICY, mode: 'auto' }
+  const cycle = scheduler.runCycle()
+  state.policy.mode = 'off'
+  scheduler.policyChanged()
+  state.policy.mode = 'auto'
+  scheduler.policyChanged()
+  finish(PUBLISHED)
+  await cycle
+  assert.deepEqual(state.started, [])
+  assert.deepEqual(scheduler.view().lastCheck, {})
+  scheduler.dispose()
+})
+
+test('disposed direct calls and stale timers are inert across restart', async () => {
+  let checks = 0
+  const { state, scheduler } = harness({ check: async () => { checks += 1; return PUBLISHED } })
+  state.policy = { ...DEFAULT_POLICY, mode: 'auto', checkAt: '03:00' }
+  state.refuse = true
+  const spy = spyTimers()
+  try {
+    scheduler.start()
+    await scheduler.consider(PUBLISHED)
+    const oldTimers = [...spy.armed]
+    const lastCheck = scheduler.view().lastCheck
+    scheduler.dispose()
+    await scheduler.consider(PUBLISHED)
+    await scheduler.runCycle()
+    assert.equal(checks, 0)
+    assert.deepEqual(scheduler.view().lastCheck, lastCheck)
+    assert.equal(scheduler.view().pendingAuto, undefined)
+    scheduler.start()
+    state.refuse = false
+    const count = spy.armed.length
+    oldTimers.forEach(timer => timer.callback())
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(state.started, [])
+    assert.equal(checks, 0)
+    assert.equal(spy.armed.length, count)
+  } finally { scheduler.dispose(); spy.restore() }
+})
+
+test('an early daily timer consumes its occurrence and schedules tomorrow, not a zero-delay refire', async () => {
+  let clock = new Date('2026-03-01T02:59:00')
+  let checks = 0
+  const { state, scheduler } = harness({ now: () => clock, check: async () => { checks += 1; return PUBLISHED } })
+  state.policy.checkAt = '03:00'
+  const spy = spyTimers()
+  try {
+    scheduler.start()
+    const first = spy.armed[0]
+    assert.equal(first.ms, 59_950)
+    clock = new Date('2026-03-01T02:59:59.950')
+    first.callback()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(checks, 1)
+    assert.equal(spy.armed.length, 2)
+    assert.equal(spy.armed[1].ms, 24 * 60 * 60 * 1000)
+    assert.equal(scheduler.view().nextCheckAt, new Date('2026-03-02T03:00:00').getTime())
+    scheduler.policyChanged()
+    assert.equal(spy.armed.at(-1).ms, 24 * 60 * 60 * 1000, 'a policy rearm also skips the consumed occurrence')
+    first.callback()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(checks, 1)
+  } finally { scheduler.dispose(); spy.restore() }
 })

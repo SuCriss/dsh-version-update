@@ -69,22 +69,29 @@ test('a corrupt lock file is stolen, not honored forever', () => {
   result.release()
 })
 
-test('own pid in the lock is stolen (a crashed self-heal)', () => {
+test('a same-pid active lock is not reentrant and a refused release preserves it', () => {
   const path = lockPath()
-  writeFileSync(path, JSON.stringify({ pid: 77, at: Date.now() }), 'utf8')
-  const result = acquireUpdateLock({ lockPath: path, pid: 77, isAlive: () => true })
-  assert.equal(result.ok, true)
+  const first = acquireUpdateLock({ lockPath: path })
+  const record = readFileSync(path, 'utf8')
+  const result = acquireUpdateLock({ lockPath: path })
+  assert.equal(result.ok, false)
+  assert.equal(result.holder.pid, process.pid)
   result.release()
+  assert.equal(readFileSync(path, 'utf8'), record)
+  first.release()
+  const next = acquireUpdateLock({ lockPath: path })
+  assert.equal(next.ok, true)
+  next.release()
 })
 
 test('a stolen lock survives the release of the holder it was stolen from', () => {
   const path = lockPath()
-  const first = acquireUpdateLock({ lockPath: path, pid: 42 })
+  const first = acquireUpdateLock({ lockPath: path, pid: 42, now: () => 1000 })
   assert.equal(first.ok, true)
-  // The exact updater scenario: a fiber reload leaves the previous run's lock
-  // in place, the replacement steals it (own pid), and the orphan then settles.
-  const second = acquireUpdateLock({ lockPath: path, pid: 42 })
-  assert.equal(second.ok, true, 'a same-pid self-heal steal must succeed')
+  // A genuinely expired holder may be replaced, but its late release must not
+  // remove the new owner's record (same PID does not establish ownership).
+  const second = acquireUpdateLock({ lockPath: path, pid: 42, now: () => 3000, maxAgeMs: 1000, isAlive: () => true })
+  assert.equal(second.ok, true, 'an expired lock may be stolen')
   first.release()
   assert.ok(readLockHolder(readFileSync(path, 'utf8')), 'the orphan release left the live lock alone')
   // A foreign takeover is refused the same way.

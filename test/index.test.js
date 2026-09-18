@@ -92,9 +92,13 @@ test('apply mounts the full core family; notes stay off without a repo slug', (t
   const paths = ctx.registered.map(route => route.path).sort()
   assert.deepEqual(paths, [
     VERSION_API.check,
+    VERSION_API.checkRun,
+    VERSION_API.restartDiagnostics,
     VERSION_API.policy,
+    VERSION_API.pendingCancel,
+    VERSION_API.preflight,
+    VERSION_API.operations,
     VERSION_API.restart,
-    VERSION_API.restartCancel,
     VERSION_API.restore,
     VERSION_API.snapshotDelete,
     VERSION_API.snapshots,
@@ -102,6 +106,38 @@ test('apply mounts the full core family; notes stay off without a repo slug', (t
     VERSION_API.update,
   ].sort(), 'the family is exactly these routes; /notes stays absent without a repo slug')
   assert.equal(new Set(paths).size, paths.length, 'the web server keys routes by path: no family may mount one twice')
+})
+
+test('preflight uses configured dataDir and remains mounted without restart support', async (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, allowRestart: false })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+  const res = await invoke(ctx.registered, VERSION_API.preflight)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.installDirWritable, true)
+  assert.equal(res.body.result.snapshotDirUsable, true)
+  assert.equal(existsSync(join(dataDir, 'snapshots')), true)
+  // A file blocking exactly the configured snapshot directory changes the
+  // verdict, proving the probe does not use the default user-profile store.
+  rmSync(join(dataDir, 'snapshots'), { recursive: true })
+  writeFileSync(join(dataDir, 'snapshots'), 'blocked')
+  const blocked = await invoke(ctx.registered, VERSION_API.preflight)
+  assert.equal(blocked.status, 200)
+  assert.equal(blocked.body.result.snapshotDirUsable, false)
+  assert.equal(blocked.body.result.ok, false)
+  assert.equal((await invoke(ctx.registered, VERSION_API.preflight, { method: 'POST' })).status, 405)
+})
+
+test('pending cancellation is wired even when restart is disabled', async (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, allowRestart: false })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+  const res = await invoke(ctx.registered, VERSION_API.pendingCancel, { method: 'POST' })
+  assert.equal(res.status, 200)
+  assert.deepEqual(res.body, { result: { cancelled: true } })
+  assert.equal((await invoke(ctx.registered, VERSION_API.pendingCancel)).status, 405)
 })
 
 test('apply seeds a policy file on first mount and serves it back', async (t) => {
@@ -168,6 +204,9 @@ test('snapshots start empty and restore reports a missing snapshot as conflict',
   // The reason matters: a 409 from lock contention would pass the status check
   // while proving nothing about the snapshot store.
   assert.match(failed.body.error, /no usable snapshot of 9\.9\.9/)
+  const progress = await invoke(ctx.registered, VERSION_API.operations)
+  assert.deepEqual(progress.body.result.events.map(entry => entry.phase), ['running', 'failed'])
+  assert.match(progress.body.result.events[1].error, /no usable snapshot/)
 })
 
 test('a panel check feeds the scheduler, so the auto decision runs without any daily timer', async (t) => {
@@ -190,6 +229,38 @@ test('a panel check feeds the scheduler, so the auto decision runs without any d
   } finally {
     globalThis.fetch = savedFetch
   }
+})
+
+test('manual check updates scheduler facts without installing under auto policy', async (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+  await invoke(ctx.registered, VERSION_API.policy, { method: 'POST', body: { mode: 'auto' } })
+  t.mock.method(globalThis, 'fetch', async () => ({
+    ok: true,
+    json: async () => ({ 'dist-tags': { latest: '9.9.9' }, versions: { '9.9.9': {}, '0.4.0': {} } }),
+  }))
+  const res = await invoke(ctx.registered, VERSION_API.checkRun, { method: 'POST' })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.result.lastCheck.target, '9.9.9')
+  assert.equal(res.body.result.task.state, 'idle')
+  assert.equal(res.body.result.pendingAuto, undefined)
+  assert.equal(existsSync(join(dataDir, 'update.lock')), false)
+})
+
+test('restart diagnostics follows dataDir and is absent when restart is disabled', async (t) => {
+  const { dataDir } = environment(t)
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir })
+  const empty = await invoke(ctx.registered, VERSION_API.restartDiagnostics)
+  assert.deepEqual(empty.body.result, { available: false, log: '', truncated: false })
+  writeFileSync(join(dataDir, 'restart.log'), 'replacement ready\n')
+  const read = await invoke(ctx.registered, VERSION_API.restartDiagnostics)
+  assert.equal(read.body.result.log, 'replacement ready\n')
+  const disabled = fakeCtx()
+  apply(disabled, { dataDir, allowRestart: false })
+  assert.equal(disabled.registered.some(route => route.path === VERSION_API.restartDiagnostics), false)
 })
 
 test('disposal unregisters every route and stops the scheduler', (t) => {
@@ -261,6 +332,13 @@ test('a restore goes through the snapshot store and back to the recorded version
   const history = JSON.parse(readFileSync(join(dataDir, 'history.json'), 'utf8'))
   assert.equal(history.at(-1).restored, true)
   assert.equal(history.at(-1).to, '0.4.0')
+  const progress = await invoke(ctx.registered, VERSION_API.operations)
+  assert.equal(progress.status, 200)
+  const events = progress.body.result.events.filter(entry => entry.kind === 'restore')
+  assert.deepEqual(events.map(entry => entry.phase), ['running', 'done'])
+  assert.equal(events[0].id, events[1].id)
+  assert.equal(events[0].data.version, '0.4.0')
+  assert.ok(events[1].seq > events[0].seq)
 })
 
 test('a snapshot delete unlinks that version, leaves the tree alone, and writes no history', async (t) => {

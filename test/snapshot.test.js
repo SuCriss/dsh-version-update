@@ -10,7 +10,7 @@ import { test } from 'node:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { createSnapshot, createSnapshotAsync, defaultSnapshotsDir, listSnapshots, measureTree, removeSnapshot, restoreSnapshot, restoreSnapshotAsync } from '../lib/snapshot.js'
+import { createSnapshot, createSnapshotAsync, defaultSnapshotsDir, listSnapshots, measureTree, removeSnapshot, restoreSnapshot, restoreSnapshotAsync, snapshotsTotalBytes, sweepSnapshots } from '../lib/snapshot.js'
 
 /** Build one fake installed dsh tree of the given version. */
 function fakeInstall(t, version) {
@@ -40,6 +40,39 @@ test('snapshot inventory reports bytes and refuses a missing payload before touc
   assert.equal(outcome.ok, false)
   assert.ok(existsSync(join(installDir, 'lib', 'bin.js')))
 })
+
+for (const [name, restore] of [['sync', restoreSnapshot], ['async', restoreSnapshotAsync]]) {
+  test(`${name} restore refuses a failed rename without overwriting live files`, async (t) => {
+    const installDir = fakeInstall(t, '1.0.0')
+    const snapshotsDir = snapHome(t)
+    assert.equal(createSnapshot({ installDir, snapshotsDir, version: '1.0.0' }).ok, true)
+    writeFileSync(join(installDir, 'package.json'), '{"version":"2.0.0"}')
+    writeFileSync(join(installDir, 'live-only.txt'), 'must survive')
+    const before = readFileSync(join(installDir, 'package.json'), 'utf8')
+    // A nonempty destination makes rename fail on every platform, without
+    // relying on OS permissions or patching filesystem module bindings.
+    t.mock.method(Date, 'now', () => 123456)
+    const stale = `${installDir}.replaced-123456`
+    mkdirSync(stale)
+    writeFileSync(join(stale, 'occupied.txt'), 'do not replace')
+    t.after(() => rmSync(stale, { recursive: true, force: true }))
+    const result = await restore({ installDir, snapshotsDir, version: '1.0.0' })
+    assert.equal(result.ok, false)
+    assert.match(result.error, /could not move the live installation aside/)
+    assert.equal(readFileSync(join(installDir, 'package.json'), 'utf8'), before)
+    assert.equal(readFileSync(join(installDir, 'live-only.txt'), 'utf8'), 'must survive')
+    assert.equal(readFileSync(join(stale, 'occupied.txt'), 'utf8'), 'do not replace')
+  })
+
+  test(`${name} restore can recreate a truly absent installation`, async (t) => {
+    const installDir = fakeInstall(t, '1.0.0')
+    const snapshotsDir = snapHome(t)
+    assert.equal(createSnapshot({ installDir, snapshotsDir, version: '1.0.0' }).ok, true)
+    rmSync(installDir, { recursive: true })
+    assert.deepEqual(await restore({ installDir, snapshotsDir, version: '1.0.0' }), { ok: true })
+    assert.ok(existsSync(join(installDir, 'lib', 'bin.js')))
+  })
+}
 
 test('defaultSnapshotsDir lives under the given home', () => {
   assert.equal(defaultSnapshotsDir({ home: '/h' }), join('/h', '.dsh-version-update', 'snapshots'))
@@ -101,6 +134,62 @@ test('pruning keeps the newest N and drops damaged entries first', (t) => {
   assert.deepEqual(versions, ['1.0.2', '1.0.3'])
 })
 
+for (const [name, create] of [['sync', createSnapshot], ['async', createSnapshotAsync]]) {
+  test(`${name} snapshot quota deletes oldest usable snapshots first after damaged pruning`, async (t) => {
+    const snapshotsDir = snapHome(t)
+    let bytes
+    for (let index = 0; index < 3; index += 1) {
+      const version = `1.0.${index}`
+      const installDir = fakeInstall(t, version)
+      if (index === 2) {
+        const damaged = join(snapshotsDir, '0.0.1')
+        mkdirSync(damaged)
+        writeFileSync(join(damaged, 'stray'), 'damaged')
+      }
+      assert.equal((await create({ installDir, snapshotsDir, version, keep: 5, maxBytes: bytes === undefined ? 0 : bytes * 2, now: () => index })).ok, true)
+      bytes ??= snapshotsTotalBytes(snapshotsDir)
+    }
+    assert.deepEqual(listSnapshots(snapshotsDir).map(entry => entry.version), ['1.0.2', '1.0.1'])
+    assert.equal(snapshotsTotalBytes(snapshotsDir), bytes * 2)
+    assert.equal(existsSync(join(snapshotsDir, '0.0.1')), false)
+  })
+
+  test(`${name} snapshot quota zero is unlimited while count retention still applies`, async (t) => {
+    const snapshotsDir = snapHome(t)
+    for (let index = 0; index < 4; index += 1) {
+      const version = `2.0.${index}`
+      const installDir = fakeInstall(t, version)
+      assert.equal((await create({ installDir, snapshotsDir, version, keep: 3, maxBytes: 0, now: () => index })).ok, true)
+    }
+    assert.deepEqual(listSnapshots(snapshotsDir).map(entry => entry.version), ['2.0.3', '2.0.2', '2.0.1'])
+    assert.ok(snapshotsTotalBytes(snapshotsDir) > 0)
+  })
+
+  test(`${name} tiny quota preserves the just-created snapshot even after clock rollback`, async (t) => {
+    const snapshotsDir = snapHome(t)
+    for (let index = 0; index < 2; index += 1) {
+      const version = `3.0.${index}`
+      const installDir = fakeInstall(t, version)
+      assert.deepEqual(await create({ installDir, snapshotsDir, version, keep: 1, maxBytes: 1, now: () => 100 - index }), { ok: true })
+    }
+    assert.deepEqual(listSnapshots(snapshotsDir).map(entry => entry.version), ['3.0.1'])
+    assert.ok(snapshotsTotalBytes(snapshotsDir) > 1, 'rollback safety beats the byte budget')
+  })
+}
+
+test('snapshot byte totals include legacy payloads without metadata byte counts', (t) => {
+  const snapshotsDir = snapHome(t)
+  assert.equal(snapshotsTotalBytes(snapshotsDir), 0)
+  const installDir = fakeInstall(t, '4.0.0')
+  assert.equal(createSnapshot({ installDir, snapshotsDir, version: '4.0.0' }).ok, true)
+  const total = snapshotsTotalBytes(snapshotsDir)
+  writeFileSync(join(snapshotsDir, '4.0.0', 'meta.json'), JSON.stringify({ version: '4.0.0', at: 1 }))
+  assert.equal(snapshotsTotalBytes(snapshotsDir), total)
+  const next = fakeInstall(t, '4.0.1')
+  assert.equal(createSnapshot({ installDir: next, snapshotsDir, version: '4.0.1', maxBytes: total, now: () => 2 }).ok, true)
+  assert.deepEqual(listSnapshots(snapshotsDir).map(entry => entry.version), ['4.0.1'])
+})
+
 test('restore swaps the live tree for the snapshot contents', (t) => {
   const install = fakeInstall(t, '2.0.0')
   const snapshotsDir = snapHome(t)
@@ -123,6 +212,46 @@ test('restore refuses versions without a usable snapshot and rejects non-version
   assert.equal(restoreSnapshot({ installDir: install, snapshotsDir, version: '3.0.0' }).ok, false)
   assert.equal(restoreSnapshot({ installDir: install, snapshotsDir, version: '../etc' }).ok, false)
   assert.equal(removeSnapshot(snapshotsDir, '../etc'), false)
+})
+
+test('a discard renames the snapshot out of the version namespace before unlinking it', async (t) => {
+  const installDir = fakeInstall(t, '6.0.0')
+  const snapshotsDir = snapHome(t)
+  assert.equal(createSnapshot({ installDir, snapshotsDir, version: '6.0.0' }).ok, true)
+
+  // The point of the rename: the version is gone from the panel the instant the
+  // call returns, with the bytes still on disk. A recursive delete in place
+  // would block the host for seconds — long enough to outlive the panel's
+  // request timeout, which is what made the button look dead.
+  assert.equal(removeSnapshot(snapshotsDir, '6.0.0'), true)
+  assert.deepEqual(listSnapshots(snapshotsDir), [])
+  assert.equal(snapshotsTotalBytes(snapshotsDir), 0)
+  const leftovers = readdirSync(snapshotsDir)
+  assert.equal(leftovers.length, 1)
+  assert.match(leftovers[0], /^\.trash-6\.0\.0-\d+$/)
+
+  // The sweep is the deterministic end of the background unlink.
+  await sweepSnapshots(snapshotsDir)
+  assert.deepEqual(readdirSync(snapshotsDir), [])
+  assert.equal(removeSnapshot(snapshotsDir, '6.0.0'), false, 'nothing left to delete')
+})
+
+test('the sweep reclaims interrupted copies and stranded tombstones, and only those', async (t) => {
+  const installDir = fakeInstall(t, '7.0.0')
+  const snapshotsDir = snapHome(t)
+  assert.equal(createSnapshot({ installDir, snapshotsDir, version: '7.0.0' }).ok, true)
+  // What a killed process leaves: a copy that never reached its rename, and a
+  // tombstone whose unlink died with the host. Neither is a version name, so
+  // the panel can never show them and nothing else would free their disk.
+  mkdirSync(join(snapshotsDir, '.tmp-7.1.0-1789697010310'), { recursive: true })
+  writeFileSync(join(snapshotsDir, '.tmp-7.1.0-1789697010310', 'package.json'), '{}')
+  mkdirSync(join(snapshotsDir, '.trash-7.2.0-1789697010311'), { recursive: true })
+  writeFileSync(join(snapshotsDir, '.trash-7.2.0-1789697010311', 'package.json'), '{}')
+
+  assert.equal(await sweepSnapshots(snapshotsDir), 2)
+  assert.deepEqual(readdirSync(snapshotsDir), ['7.0.0'], 'the usable snapshot survived the sweep')
+  assert.deepEqual(listSnapshots(snapshotsDir).map(entry => entry.version), ['7.0.0'])
+  assert.equal(await sweepSnapshots(snapshotsDir), 0, 'a clean store sweeps nothing')
 })
 
 test('the async restore matches the synchronous one and leaves nothing beside', async (t) => {

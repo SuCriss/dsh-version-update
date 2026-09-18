@@ -11,3 +11,7 @@ probe-*.mjs
 diagnose-*.mjs
 reproduce-*.mjs
 *.tgz
+# Local agent metadata: project memory and pre-merge backup patches. It records
+# absolute paths on the development machine and the working notes behind each
+# change, none of which belongs in a published repository.
+.workbuddy-ai/

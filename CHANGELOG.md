@@ -3,6 +3,116 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.3.0] - 2026-09-18
+
+### Changed
+
+- **Restarting is the panel's button and nothing else.** The policy field
+  `restart` is gone (`ask` / `auto`), along with the host-side fallback
+  `restartAfterDelay`, the `/restart/cancel` route and the browser half's
+  offer/countdown dialogs. A settled install now opens no window at all, and the
+  only thing that hands the port over is a click on 「立即重启」. The reason is the
+  one the old fallback existed to paper over — the install rewrites the very
+  files the page is served from, so the page that would have answered a dialog is
+  often already blank; and a host that restarts itself is indistinguishable from
+  a host that crashed. A file still carrying `"restart": "auto"` loads fine and
+  the key is ignored.
+- **The 「立即重启」 button moved out of the install-task card.** That card only
+  renders while a task is not idle, and the case the button exists for is exactly
+  the one where the task IS idle: a page reloaded after an install settles. It now
+  sits in the always-rendered current-installation card, next to the check button
+  and directly under the line that explains why it is there. Exactly one instance
+  is on the page at any time.
+
+### Fixed
+
+- **「删除快照」 looked like a dead button.** `removeSnapshot` deleted the
+  snapshot directory in place with a synchronous recursive unlink, inside the
+  route handler. A snapshot is a full copy of the installed package tree — the
+  one on this machine was 223 MB — and on Windows that measures in the seconds
+  (a measured 129 MB / 15 569-file tree took 5.6 s, with Defender scanning every
+  entry), which outlives the panel's 15 s request timeout and freezes the whole
+  host while it runs. The user saw a first click arm the row, a second click do
+  nothing, and the row still there. Deletion now RENAMES the directory to a
+  hidden `.trash-*` tombstone — a metadata operation, instant however large the
+  snapshot — answers immediately with the fresh list, and unlinks the bytes on
+  the threadpool. A tombstone is not a version name, so the version leaves the
+  panel the moment the call returns.
+- **Snapshot directories a killed process left behind were never reclaimed.**
+  An interrupted copy (`.tmp-*`) and a tombstone whose unlink died with the host
+  (`.trash-*`) are invisible to the panel and to every pruning pass, because
+  neither is a version name — one had been sitting in the store since 2026-09-17.
+  A sweep now runs at host start and after every discard.
+
+## [1.2.0] - 2026-09-17
+
+### Added
+
+- **The install card is a progress bar instead of a scrolling log.** npm prints
+  nothing during the fetch phase and the tree does not move, so the panel used to
+  show a snapshot line and then silence. The host now models the run in phases
+  (`preparing` → `snapshot` → `download` → `extract` → `done`) and measures what
+  it can: the snapshot's own byte and file counts, the install tree's byte count
+  for extraction (against the snapshot's measured size as denominator), and npm's
+  own cache scratch file (`_cacache/tmp`, resolved the way npm resolves it) as the
+  only evidence that a download is moving at all. Where there is no denominator
+  the bar is deliberately indeterminate and shows the bytes seen — never a
+  percentage it cannot support — and a phase with no signal is treated as `blind`
+  rather than stalled, because "no signal" and "no change" are different facts.
+  npm's output is still collected (it is what keeps a run from looking dead) but
+  it now sits behind a "Show detailed log" toggle instead of being pushed at the
+  user.
+- **A fallback install source (the Taobao mirror).** `POST /update` takes an
+  optional `source` of `auto` / `official` / `mirror`, chosen on the confirm card;
+  `auto` keeps following whichever registry actually served the version read. The
+  host never accepts a URL from the browser — the addresses live in entry config
+  (`registry`, plus the new `mirrorRegistry`, default
+  `https://registry.npmmirror.com`) — and anything that is not one of those three
+  identifiers is a 400. A run with no measurable movement for 30 seconds says so
+  and names the mirror as the next step, but is not interrupted: killing npm
+  mid-reify is what leaves a half-committed tree. Once it settles, the failure
+  card offers a one-click retry of the same version against the mirror.
+- **A local preflight before an install commits to anything.** The confirmation
+  card reads `GET /preflight` — npm resolvable, install parent writable, free
+  disk space, snapshot storage usable — and shows the answer while the user is
+  still deciding. Every check degrades to a warning rather than a refusal, and
+  none of it runs npm or touches the network: it is advice, not a gate.
+- **An activity timeline of what this host run has done.** Installs, restores
+  and repair passes are kept in a bounded in-memory log (the latest 200) and
+  served by `GET /operations?since=N` behind a monotonic cursor, so the panel
+  appends instead of re-reading. It resets when the host reloads, and an install
+  records only its settlement — never an invented start.
+- **Waiting automatic work can be cancelled.** `POST /pending/cancel` disarms a
+  parked auto install and its window wake / busy retry without touching the
+  policy or the daily check; the panel shows the target and when it was queued.
+- **`snapshotMaxBytes` caps the snapshot store.** After a successful creation,
+  damaged and count-expired snapshots go first, then the oldest usable ones,
+  until the store fits the quota — the snapshot just taken always survives, even
+  if it alone exceeds it.
+- **A failed install restores the version it replaced.** The repair path takes
+  `preferredVersion` — the version that run started from — and restores that
+  exact snapshot instead of "whichever snapshot is newest". The caller knows
+  which version the user was running, and the newest one is the wrong answer
+  when the install itself is what went wrong.
+
+### Changed
+
+- **A successful install no longer restarts the host on a countdown.** Under
+  `restart: ask` the page shows an explicit "Restart now / Later" dialog and
+  nothing restarts until it is answered; `restart: auto` keeps its unattended
+  grace period. The old wording promised a countdown the panel no longer ran.
+- **`requireSnapshot` (default true) makes the pre-install snapshot mandatory.**
+  A snapshot that cannot be written now aborts the run before npm is spawned
+  (`FatalPreparationError`) instead of being logged and stepped over — an install
+  with no rollback point is precisely the kind that can leave the user with no
+  working version. Set it false for the old best-effort behaviour.
+- **Tree repair treats a tree that cannot be launched as damaged.** A manifest
+  alone was never enough — an interrupted install can leave one that parses while
+  `lib/bin.js` is gone — so `inspectTreeHealth` reports `launcherOk` and every
+  repair pass requires it, not just the one that follows a failure. The
+  recent-retirement guard is what keeps that check from racing an npm that is
+  still writing.
+
 ## [1.1.8] - 2026-09-12
 
 ### Fixed
