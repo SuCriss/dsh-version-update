@@ -3,6 +3,36 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.4.1] - 2026-09-28
+
+### Fixed
+
+- **An install, and the repair that follows it, can no longer be blocked by the
+  host's own working directory.** npm's reify retires the package it replaces by
+  renaming that directory aside, and Windows refuses to rename a directory that
+  is any live process's working directory: the directory itself held reports
+  `EBUSY`, a held *child* reports `EPERM` against its parent. `dsh web` inherits
+  the shell's cwd, so a host started from inside its own tree handed npm the very
+  directory it was about to replace — every attempt at `0.1.7-rc.2` died with
+  `EBUSY` on `dsh\lib` while npm's own cwd *was* that directory, and the repair
+  that ran afterwards failed on the same condition, surfacing as a bare `EPERM`.
+  npm is now spawned from the temp directory, outside every tree this plugin
+  manages. The detached relaunch helper gets the same treatment, because it is
+  the process that may have to rename the live tree back; the *replacement*'s cwd
+  still travels in the payload, since it has to match the host being replaced.
+- **A rename that fails because the tree is held now says so.** `EPERM` on the
+  live-tree rename reads as a permissions problem and sends the user hunting for
+  one that does not exist. `EPERM`/`EBUSY`/`EACCES` there are now translated into
+  the actual cause and the way out — quit dsh, then `npm install -g
+  @deepseek-ai/dsh@latest` from a terminal. A rename target that is merely
+  *taken* reports the same `EPERM` on Windows and is deliberately not blamed on
+  occupancy.
+- **A repair that restored nothing is no longer recorded as a success.** The
+  audit trail wrote `ok` whenever `package.json` still parsed, so a pass that
+  told the panel it had failed — and left `treeHealth.healthy` false — showed up
+  as a clean repair in `history.json`. It now shares the predicate used by the
+  panel message, `operations.end` and `treeHealth.healthy`.
+
 ## [1.4.0] - 2026-09-18
 
 ### Added
