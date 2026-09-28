@@ -59,6 +59,10 @@ for (const [name, restore] of [['sync', restoreSnapshot], ['async', restoreSnaps
     const result = await restore({ installDir, snapshotsDir, version: '1.0.0' })
     assert.equal(result.ok, false)
     assert.match(result.error, /could not move the live installation aside/)
+    // A taken target name is NOT the occupancy failure Windows reports with the
+    // same EPERM: blaming a running process here would send the user hunting
+    // for one that does not exist.
+    assert.doesNotMatch(result.error, /held by a running process/)
     assert.equal(readFileSync(join(installDir, 'package.json'), 'utf8'), before)
     assert.equal(readFileSync(join(installDir, 'live-only.txt'), 'utf8'), 'must survive')
     assert.equal(readFileSync(join(stale, 'occupied.txt'), 'utf8'), 'do not replace')
@@ -73,6 +77,28 @@ for (const [name, restore] of [['sync', restoreSnapshot], ['async', restoreSnaps
     assert.ok(existsSync(join(installDir, 'lib', 'bin.js')))
   })
 }
+
+test('a tree held as a working directory is reported as held, not as a bare code', { skip: process.platform !== 'win32' }, (t) => {
+  const installDir = fakeInstall(t, '1.0.0')
+  const snapshotsDir = snapHome(t)
+  assert.equal(createSnapshot({ installDir, snapshotsDir, version: '1.0.0' }).ok, true)
+
+  // Windows refuses to rename a directory that is a live process's working
+  // directory, and that refusal — not a permission problem — is what the
+  // message has to explain. POSIX allows the rename, so the case is Windows
+  // only; there the same call succeeds and this message never appears.
+  const original = process.cwd()
+  process.chdir(installDir)
+  try {
+    const result = restoreSnapshot({ installDir, snapshotsDir, version: '1.0.0' })
+    assert.equal(result.ok, false)
+    assert.match(result.error, /could not move the live installation aside/)
+    assert.match(result.error, /held by a running process/)
+    assert.match(result.error, /npm install -g @deepseek-ai\/dsh@latest/)
+  } finally {
+    process.chdir(original)
+  }
+})
 
 test('defaultSnapshotsDir lives under the given home', () => {
   assert.equal(defaultSnapshotsDir({ home: '/h' }), join('/h', '.dsh-version-update', 'snapshots'))

@@ -17,8 +17,8 @@ function harness(overrides = {}) {
   let exited
   const dir = mkdtempSync(join(tmpdir(), 'vu-restart-'))
   const payloadPath = join(dir, 'payload.json')
-  const spawnImpl = (execPath, args) => {
-    spawned.push({ execPath, args })
+  const spawnImpl = (execPath, args, options) => {
+    spawned.push({ execPath, args, options })
     return { unref() {} }
   }
   const deps = {
@@ -46,6 +46,24 @@ function harness(overrides = {}) {
     },
   }
 }
+
+test('the detached helper starts outside the tree it may have to restore', () => {
+  // The helper is the process that runs `restoreSnapshot` when the replacement
+  // never becomes reachable — a rename of the live tree. It inherits this
+  // process's cwd, and on Windows a directory that is any live process's
+  // working directory cannot be renamed, so a host started from inside its own
+  // tree would hand the helper a cwd that blocks the very restore it exists to
+  // perform. The REPLACEMENT's cwd still travels in the payload: it has to
+  // match the host being replaced.
+  const h = harness()
+  try {
+    h.restarter.restart()
+    assert.equal(h.spawned[0].options?.cwd, tmpdir(), 'the helper must not inherit the host working directory')
+    assert.equal(h.payload().cwd, '/cwd')
+  } finally {
+    h.cleanup()
+  }
+})
 
 test('parseRequestedPort reads both --port N and --port=N forms', () => {
   assert.equal(parseRequestedPort(['node', 'bin.js', '--port', '3080']), 3080)

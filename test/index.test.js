@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -353,6 +353,31 @@ test('a restore goes through the snapshot store and back to the recorded version
   assert.equal(events[0].id, events[1].id)
   assert.equal(events[0].data.version, '0.4.0')
   assert.ok(events[1].seq > events[0].seq)
+})
+
+test('a repair that restored nothing is not recorded as a successful one', async (t) => {
+  const { installDir, dataDir } = environment(t)
+  // A retired folder left behind by a killed npm, dated far enough back for the
+  // boot repair to claim it — that is what makes the pass run at all.
+  // `environment` builds a tree whose launcher is missing, so the pass reports
+  // the damage and restores nothing. The panel says the repair did not fully
+  // succeed, and the audit trail must not call the same pass `ok` merely
+  // because package.json still parses.
+  const leftover = join(installDir, 'node_modules', '.foo-12345678')
+  mkdirSync(leftover, { recursive: true })
+  utimesSync(leftover, new Date(0), new Date(0))
+
+  const ctx = fakeCtx()
+  const savedError = console.error
+  console.error = () => {}
+  try {
+    apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
+  } finally {
+    console.error = savedError
+  }
+  const history = JSON.parse(readFileSync(join(dataDir, 'history.json'), 'utf8'))
+  assert.equal(history.at(-1).restored, true, 'the pass is still recorded as a repair')
+  assert.equal(history.at(-1).result, 'failed', 'a repair that restored nothing did not succeed')
 })
 
 test('a snapshot delete unlinks that version, leaves the tree alone, and writes no history', async (t) => {

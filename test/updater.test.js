@@ -48,12 +48,12 @@ function fakeChild() {
   return child
 }
 
-/** A spawn stub collecting every invocation. */
+/** A spawn stub collecting every invocation, options included. */
 function spawnStub() {
   const calls = []
-  const stub = (execPath, args) => {
+  const stub = (execPath, args, options) => {
     const child = fakeChild()
-    calls.push({ execPath, args, child })
+    calls.push({ execPath, args, options, child })
     return child
   }
   return Object.assign(stub, { calls })
@@ -102,6 +102,35 @@ test('start spawns node npm-cli.js without a shell and settles on exit 0', async
   assert.equal(view.state, 'done')
   assert.match(view.log, /added 1 package/)
   assert.deepEqual(settled, [{ version: '0.5.0', ok: true, trigger: 'scheduled' }])
+})
+
+test('npm is spawned outside every tree this plugin replaces, never in the host cwd', async (t) => {
+  // npm's reify retires the package it replaces by RENAMING that directory
+  // aside, and on Windows a directory that is any live process's working
+  // directory cannot be renamed: the directory itself held reports EBUSY, a
+  // held CHILD reports EPERM against its parent. Without an explicit cwd the
+  // child inherits this host's, and a `dsh web` started from inside its own
+  // tree hands npm the very directory it is about to replace — the install
+  // then dies with EBUSY on `dsh\lib` while npm's own cwd IS that directory.
+  const spawn = spawnStub()
+  const updater = createUpdater({
+    spawnImpl: spawn,
+    npmCli: '/npm/cli.js',
+    lockPath: FILE_LOCK,
+  })
+  t.after(() => updater.dispose())
+
+  updater.start('0.5.0', 'manual')
+  const call = spawn.calls[0]
+  // Settle the run before asserting. A failed assertion here would otherwise
+  // leave the process-wide slot claimed, and every later test in this file
+  // would die with 'an update is already running' instead of its own reason.
+  call.child.exitCode = 0
+  call.child.emit('close', 0)
+  await Promise.resolve()
+
+  assert.equal(call.options?.cwd, tmpdir(), 'npm must be given a cwd outside the trees this plugin manages')
+  assert.notEqual(call.options?.cwd, process.cwd(), 'inheriting the host cwd is exactly the bug')
 })
 
 test('an install asks the registry that served the versions, not the configured one', async (t) => {

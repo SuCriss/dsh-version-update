@@ -17,8 +17,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { probeAddress, RELAUNCH_SCRIPT } from '../lib/restarter.js'
 
-/** The tiny program the helper relaunches: live for `ms`, then exit. */
-const REPLACEMENT = (ms, port) => `require('node:net').createServer().listen(${port},'127.0.0.1');setTimeout(() => process.exit(0), ${String(ms)})`
+/**
+ * The tiny program the helper relaunches: it answers on `port`, stays live for
+ * `ms` AFTER the bind succeeds, then exits. The clock starts at the bind rather
+ * than at process start, because a cold node takes seconds to get that far on
+ * Windows and that startup delay must not eat the answering window this fixture
+ * exists to provide.
+ */
+const REPLACEMENT = (ms, port) => `require('node:net').createServer().listen(${port},'127.0.0.1',() => setTimeout(() => process.exit(0), ${String(ms)}))`
 
 /** A process that holds nothing and exits after `ms`. */
 const SLEEPER = ms => `setTimeout(() => process.exit(0), ${String(ms)})`
@@ -108,7 +114,7 @@ test('an armed recovery leaves a replacement that answers alone', async (t) => {
     args: ['-e', REPLACEMENT(1200, occupied.port)],
     cwd: dir,
     recovery: { version: '9.9.9', installDir: dir, snapshotsDir: join(dir, 'no-snapshots') },
-    timeouts: { waitMs: 200, settleMs: 20, probeIntervalMs: 40, replacementProbeMs: 4000, recoveryProbeMs: 300 },
+    timeouts: { waitMs: 200, settleMs: 20, probeIntervalMs: 40, replacementProbeMs: 15000, recoveryProbeMs: 300 },
   })
   assert.match(outcome.log, /update stands/, JSON.stringify(outcome))
   assert.doesNotMatch(outcome.log, /restoring snapshot/, 'a healthy replacement is not rolled back')
