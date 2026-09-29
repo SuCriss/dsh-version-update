@@ -76,6 +76,33 @@ for (const [name, restore] of [['sync', restoreSnapshot], ['async', restoreSnaps
     assert.deepEqual(await restore({ installDir, snapshotsDir, version: '1.0.0' }), { ok: true })
     assert.ok(existsSync(join(installDir, 'lib', 'bin.js')))
   })
+
+  test(`${name} restore leaves the snapshot's own metadata out of the live tree`, async (t) => {
+    const installDir = fakeInstall(t, '8.0.0')
+    const snapshotsDir = snapHome(t)
+    // A nested meta.json is package content and must survive the round trip.
+    // Only the snapshot's own TOP-LEVEL record is the plugin's.
+    mkdirSync(join(installDir, 'lib', 'vendor'), { recursive: true })
+    writeFileSync(join(installDir, 'lib', 'vendor', 'meta.json'), '{"nested":true}')
+    assert.equal(createSnapshot({ installDir, snapshotsDir, version: '8.0.0' }).ok, true)
+    assert.ok(existsSync(join(snapshotsDir, '8.0.0', 'meta.json')), 'the snapshot carries its own metadata')
+
+    // Move the live tree on, as an install would, then roll it back.
+    writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '8.1.0' }))
+    assert.deepEqual(await restore({ installDir, snapshotsDir, version: '8.0.0' }), { ok: true })
+
+    // The snapshot directory doubles as the payload, so copying the store back
+    // verbatim used to plant the plugin's own meta.json — a multi-megabyte
+    // inventory of the whole tree — inside the installation: a file npm never
+    // wrote, will never remove, and cannot tell from package content.
+    assert.equal(existsSync(join(installDir, 'meta.json')), false, 'the snapshot record must not land in the live tree')
+    // The record stays in the store, where it is what makes the snapshot valid.
+    assert.equal(JSON.parse(readFileSync(join(snapshotsDir, '8.0.0', 'meta.json'), 'utf8')).version, '8.0.0')
+    // Over-filtering is the other way to get this wrong: the exclusion is the
+    // top level only, so a package's own nested meta.json still comes back.
+    assert.equal(readFileSync(join(installDir, 'lib', 'vendor', 'meta.json'), 'utf8'), '{"nested":true}')
+    assert.ok(existsSync(join(installDir, 'lib', 'bin.js')), 'the rest of the payload is untouched')
+  })
 }
 
 test('a tree held as a working directory is reported as held, not as a bare code', { skip: process.platform !== 'win32' }, (t) => {
