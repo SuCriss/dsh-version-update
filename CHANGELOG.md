@@ -3,6 +3,44 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.4.2] - 2026-09-29
+
+### Fixed
+
+- **Restoring a snapshot no longer drops the snapshot's own record into the
+  live installation.** A snapshot directory is two things at once: the store
+  entry *and* the payload. The payload is a copy of the install tree, and the
+  store entry carries the plugin's own `meta.json` — version, timestamp, file
+  manifest — which `createSnapshot` writes into that same directory. Restore
+  copied the directory wholesale, so `meta.json` landed at the root of the live
+  tree, where it is not a file the package ships and not one npm will ever
+  remove. One machine had **9 `restored: true` entries** in `history.json`, the
+  last at `09:35:42`, against a live tree whose `meta.json` had grown to
+  **2,496,985 bytes / 26,513 records**; the copy now filters that one path, and
+  only that one — a `meta.json` nested in a subdirectory of the payload is
+  payload, not record, and is copied as before.
+- **A retired folder that the boot sweep had to defer is now reclaimed.** npm
+  retires the package it replaces by renaming it to a dot-prefixed sibling
+  (`.dsh-<8 random chars>`) and deletes it when reify finishes; a killed install
+  leaves it behind, and npm's own reader ignores every dot-prefixed directory,
+  so it is never collected. The boot pass sweeps those folders but deliberately
+  skips any younger than ten minutes, to avoid racing an install that is still
+  writing. It then never came back: a leftover found at mount time that was too
+  young to touch was reported to the panel and left in place until the next
+  boot, which on a host that stays up is never. The mount now arms a one-shot
+  timer for the moment the folder ages past the gate, re-checking that the
+  updater is idle before it runs. This machine's `.dsh-MzqSjRg1` — 134 MB, and
+  created **2026-09-18**, not by the failed 09-28 install — was exactly that
+  case: detected at every mount, deleted at none.
+- **The Windows per-user npm prefix is found without `APPDATA`.** The
+  global-install search rooted itself at `%APPDATA%\npm\node_modules`, which is
+  the authoritative location but is not guaranteed to be in the environment the
+  host was launched with — a host started from a shell that never received it
+  resolves no global prefix at all, and the settings page then reports the
+  installation as unmanaged. `USERPROFILE` now backs it up. Measured on this
+  machine: `process.env.APPDATA` is `undefined` while `USERPROFILE` has a value,
+  so the fallback is the path that actually resolves here.
+
 ## [1.4.1] - 2026-09-28
 
 ### Fixed
