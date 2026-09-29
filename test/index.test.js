@@ -380,6 +380,35 @@ test('a repair that restored nothing is not recorded as a successful one', async
   assert.equal(history.at(-1).result, 'failed', 'a repair that restored nothing did not succeed')
 })
 
+test('a retired folder the boot sweep had to defer is reclaimed once it ages past the gate', async (t) => {
+  const { installDir, dataDir } = environment(t)
+  // A healthy tree, so the pass that runs is only ever about the litter: a
+  // damaged one would send the repair looking for a snapshot instead.
+  mkdirSync(join(installDir, 'lib'), { recursive: true })
+  writeFileSync(join(installDir, 'lib', 'bin.js'), '// launcher')
+
+  // A killed npm's retired folder, dated just INSIDE the boot gate — too young
+  // for the mount pass to delete, which is what makes that pass defer it. The
+  // deferral is the point: the mount pass runs exactly once, so without a
+  // follow-up the folder and its full copy of the tree sit on disk until the
+  // next restart. Dating it a second and a half inside the gate rather than
+  // ten minutes inside is what lets this run in real time instead of mocking
+  // every timer the plugin owns.
+  const leftover = join(installDir, 'node_modules', '.foo-12345678')
+  mkdirSync(leftover, { recursive: true })
+  const inside = 1500
+  const at = Date.now() - (10 * 60 * 1000) + inside
+  utimesSync(leftover, new Date(at), new Date(at))
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
+  assert.ok(existsSync(leftover), 'a retired folder younger than the gate survives the mount pass')
+
+  // The follow-up waits out the rest of the gate and then sweeps.
+  await new Promise(resolve => { setTimeout(resolve, inside + 1500) })
+  assert.equal(existsSync(leftover), false, 'the deferred pass reclaimed the leftover')
+})
+
 test('a snapshot delete unlinks that version, leaves the tree alone, and writes no history', async (t) => {
   const { installDir, dataDir } = environment(t)
   const snapshotsDir = join(dataDir, 'snapshots')
