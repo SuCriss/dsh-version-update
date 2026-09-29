@@ -5,6 +5,9 @@
  */
 
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import {
   buildView,
@@ -14,6 +17,7 @@ import {
   normalizeRegistry,
   parseVersion,
   readInstalled,
+  resolveInstallationDir,
   resolveTarget,
   repositorySlug,
   createNotesReader,
@@ -205,4 +209,46 @@ test('the notes reader caches per version, honours the TTL, and evicts least-rec
   await reader('o/r', '3.0.0')
   await reader('o/r', '2.0.0') // was evicted when 1.0.0 was re-read
   assert.equal(fetches.length, 6)
+})
+
+/** Lay out one fake global npm prefix under `root` and return the package dir. */
+function fakeGlobalInstall(root) {
+  const install = join(root, 'npm', 'node_modules', '@deepseek-ai', 'dsh')
+  mkdirSync(install, { recursive: true })
+  writeFileSync(join(install, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '9.9.9' }))
+  return install
+}
+
+test('the per-user npm prefix is found from USERPROFILE when APPDATA never arrived', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'vu-core-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const profile = join(root, 'profile')
+  const install = fakeGlobalInstall(join(profile, 'AppData', 'Roaming'))
+
+  // `argv` names no launcher, and the anchor sits in a tree with no
+  // node_modules above it, so neither the launcher path nor module resolution
+  // can answer — the global probe is the only thing left.
+  const base = {
+    argv: ['node', 'entry.js'],
+    anchor: join(root, 'anchor.js'),
+    execPath: join(root, 'node', 'bin', 'node'),
+  }
+
+  // The shape a shell that rebuilds the environment leaves behind: the
+  // directory `%APPDATA%` points at survives under its own name, the variable
+  // npm documents does not. Measured on this machine — `process.env.APPDATA`
+  // is undefined from Git Bash while `USERPROFILE` is set.
+  assert.equal(
+    resolveInstallationDir({ ...base, env: { USERPROFILE: profile } }),
+    install,
+    'dropping APPDATA must not cost the plugin its own installation',
+  )
+
+  // APPDATA stays authoritative when it IS there: a redirected profile is a
+  // real configuration, and the USERPROFILE-derived default would miss it.
+  const redirected = fakeGlobalInstall(join(root, 'redirected'))
+  assert.equal(
+    resolveInstallationDir({ ...base, env: { APPDATA: join(root, 'redirected'), USERPROFILE: profile } }),
+    redirected,
+  )
 })
