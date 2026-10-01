@@ -3,6 +3,65 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.4.3] - 2026-10-02
+
+### Fixed
+
+- **A retired folder's age is now read from the directory that HOLDS it, not
+  from the folder itself.** npm retires the package it replaces by RENAMING it
+  aside (arborist `lib/retire-path.js`), and a rename updates the parent's mtime
+  while leaving the renamed directory's own mtime untouched. A folder retired one
+  second ago therefore still reported whatever mtime it had when it was last
+  written — for a package installed days ago, days old — so the ten-minute
+  freshness gate read a live retirement as ancient. The boot repair could then
+  delete the retired copies of a reify that was still running, or restore a
+  snapshot over the very tree npm was still writing. Freshness is now the YOUNGER
+  of the two mtimes, which can only ever protect more. The tests drive a real
+  `renameSync` instead of back-dating the child with `utimesSync`, which is how
+  the bug survived: the fixture manufactured the age the gate was supposed to
+  infer. Measured on this machine, a rename left the child at **30.0 days** old
+  while moving the parent to **0.0 s**.
+- **The deferred-sweep timer no longer holds a quitting host open.** It is
+  `unref()`'d like every other timer in the plugin. Correcting the age evidence
+  above made the COMMON case — a folder retired moments ago — express its wait as
+  the entire gate, so a host stayed alive for up to ten minutes after the user
+  had already quit it. Found because the test suite hung for two minutes.
+- **Every path that writes the installation tree now takes the machine-wide
+  update lock.** Only the post-failure repair did; the boot repair and the
+  deferred sweep checked `updater.busy()`, which covers this process and nothing
+  else — so a second host mid-install (the desktop app updating while the user
+  starts `dsh web` in a terminal) could have its tree rebuilt underneath it. The
+  age gate is not a substitute: it bounds the DELETES a pass may do, never its
+  RESTORE branch. A pass that finds the tree taken is deferred rather than
+  dropped, and the deferral is bounded.
+- **An install run abandoned by the hard ceiling can no longer spawn its stale
+  target over the next run.** Every guard asked "is my run still the live one?"
+  by reading the shared `task.state`, and both `settle()` and `start()` REPLACE
+  the task object — so a pipeline abandoned while its snapshot was still copying
+  read the NEXT run's `running` out of that binding, spawned npm for its own
+  stale version, and then settled the new run with the old run's outcome. The
+  panel and `history.json` both recorded a success for an install that never
+  happened, while the version the user actually asked for was never spawned at
+  all. Each run now holds a monotonic identity, and `settle()` is inert for a run
+  that is no longer live.
+- **The update lock is atomic to publish and identity-safe to steal.** The record
+  used to be written AFTER `open(path, 'wx')` created the path, leaving an EMPTY
+  lock file visible for one syscall; an empty lock is indistinguishable from a
+  corrupt one, which every reader treats as stale and steals — so two hosts
+  starting an install at the same instant could both believe they held the lock.
+  It is now written to a private temp file and hard-linked into place. Stealing
+  had the same two-step shape: a bare `rmSync` after the staleness judgement
+  could delete a record that had replaced the stale one in between, which is the
+  new holder's lock, and both hosts then installed into one global tree. The
+  removal now claims the file by renaming it aside, confirms it took the record
+  it judged stale, and puts back anything that is not.
+- **The audit trail no longer calls a litter sweep a snapshot restore.**
+  `restored` was set for EVERY repair pass, so a pass that only deleted retired
+  folders rendered as "snapshot restore" — a version transition the trail never
+  witnessed. The event kind (`repair`) and what it did (`restored`, `removed`)
+  are now separate fields, which also keeps a repair that merely reported an
+  error from rendering as a plain failed install.
+
 ## [1.4.2] - 2026-09-29
 
 ### Fixed
