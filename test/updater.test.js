@@ -379,6 +379,59 @@ test('a wedged install is killed only at the hard ceiling and reported failed', 
   await Promise.resolve()
 })
 
+test('a run abandoned by the hard ceiling never spawns its stale target over the next run', async (t) => {
+  const spawn = spawnStub()
+  const settled = []
+  /** @type {Map<string, () => void>} */
+  const gates = new Map()
+  const updater = createUpdater({
+    spawnImpl: spawn,
+    npmCli: '/n',
+    lockPath: FILE_LOCK,
+    timeoutMs: 30,
+    hardTimeoutMs: 60,
+    beforeSpawn: version => new Promise(resolve => { gates.set(version, resolve) }),
+    onSettled: info => settled.push(info),
+  })
+  t.after(() => updater.dispose())
+
+  updater.start('1.0.0')
+  // The hard ceiling fires while the snapshot is still copying. The run is
+  // reported failed and gives up its slot — but its pipeline is still suspended
+  // inside `beforeSpawn`, and nothing has been spawned yet.
+  await new Promise(resolve => setTimeout(resolve, 120))
+  assert.equal(updater.view().state, 'failed')
+  assert.equal(spawn.calls.length, 0, 'nothing was spawned during preparation')
+
+  // A new run is admitted, which is correct here: no npm exists to race.
+  updater.start('2.0.0')
+  assert.equal(updater.view().state, 'running')
+  assert.equal(updater.view().version, '2.0.0')
+
+  // Now let the ABANDONED pipeline resume. Guarded on `task.state` it reads the
+  // NEXT run's `running` and spawns npm for 1.0.0 — then settles 2.0.0 as done,
+  // recording a success for an install that never ran, while the version the
+  // user asked for is never spawned at all.
+  gates.get('1.0.0')()
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(spawn.calls.length, 0, 'the abandoned run must not spawn npm for its stale target')
+
+  // The live run proceeds normally, on ITS target.
+  gates.get('2.0.0')()
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(spawn.calls.length, 1)
+  assert.deepEqual(spawn.calls[0].args.slice(2, 4), ['-g', '@deepseek-ai/dsh@2.0.0'])
+
+  spawn.calls[0].child.exitCode = 0
+  spawn.calls[0].child.emit('close', 0)
+  await Promise.resolve()
+  assert.equal(updater.view().state, 'done')
+  assert.deepEqual(settled, [
+    { version: '1.0.0', ok: false, trigger: 'manual' },
+    { version: '2.0.0', ok: true, trigger: 'manual' },
+  ], 'the abandoned run reports its own failure, and only the live run reports a success')
+})
+
 test('a refused start never leaves the machine-wide lock behind', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'vu-lock-'))
   const lockPath = join(dir, 'update.lock')
