@@ -6,7 +6,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, existsSync, rmSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, existsSync, rmSync, readFileSync, renameSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -135,6 +135,51 @@ test('the freshness guard leaves young retirements alone on the boot path', () =
   } finally {
     rmSync(base, { recursive: true, force: true })
   }
+})
+
+test('a retirement made by a real rename reads as young, so a live reify keeps its copies', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'dsh-vu-rename-'))
+  t.after(() => rmSync(base, { recursive: true, force: true }))
+  const installDir = join(base, 'dsh')
+  const bundled = join(installDir, 'node_modules')
+  // A healthy tree, so the only thing either pass can act on is the litter.
+  mkdirSync(join(installDir, 'lib'), { recursive: true })
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '2.0.0' }))
+  writeFileSync(join(installDir, 'lib', 'bin.js'), '// launcher')
+  mkdirSync(join(bundled, 'foo', 'lib'), { recursive: true })
+  writeFileSync(join(bundled, 'foo', 'package.json'), '{"name":"foo","version":"1.0.0"}')
+
+  // The package was installed days ago, so the directory npm is about to retire
+  // carries an old mtime...
+  const longAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+  utimesSync(join(bundled, 'foo'), longAgo, longAgo)
+
+  // ...and npm now retires it exactly the way arborist does: a RENAME. That
+  // leaves the renamed directory's own mtime at 30 days old while the parent's
+  // moves to now — the asymmetry the age gate has to read correctly. Reading the
+  // child's mtime is how a retirement belonging to a reify that is STILL RUNNING
+  // gets classified as ancient and deleted underneath it.
+  renameSync(join(bundled, 'foo'), join(bundled, '.foo-12345678'))
+
+  const leftovers = scanRetiredLeftovers(installDir)
+  assert.equal(leftovers.length, 1)
+  assert.equal(leftovers[0].name, '.foo-12345678')
+  assert.ok(
+    leftovers[0].ageMs < RETIRED_MIN_AGE_MS,
+    `a just-retired folder must read as young, got ageMs=${String(leftovers[0].ageMs)}`,
+  )
+
+  // The boot-path guard therefore protects it — which is the entire point of
+  // the gate: this retirement may belong to an npm orphan that is still writing.
+  const guarded = repairTree({ installDir, snapshotsDir: join(base, 'snapshots'), minAgeMs: RETIRED_MIN_AGE_MS })
+  assert.equal(guarded.removed, 0, 'a retirement from a possibly-live reify is reported, never deleted')
+  assert.deepEqual(guarded.leftovers.map(entry => entry.name), ['.foo-12345678'])
+  assert.equal(existsSync(join(bundled, '.foo-12345678')), true)
+
+  // The post-settlement pass has no age gate, and still reclaims the same litter.
+  const ungated = repairTree({ installDir, snapshotsDir: join(base, 'snapshots'), minAgeMs: 0 })
+  assert.equal(ungated.removed, 1)
+  assert.equal(existsSync(join(bundled, '.foo-12345678')), false)
 })
 
 test('a healthy tree needs no repair', (t) => {

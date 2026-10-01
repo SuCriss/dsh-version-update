@@ -12,6 +12,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { VERSION_API, DEFAULT_POLICY } from '../lib/protocol.js'
 import { createSnapshotAsync } from '../lib/snapshot.js'
+import { RETIRED_MIN_AGE_MS } from '../lib/tree-health.js'
 import { apply } from '../lib/index.js'
 
 /**
@@ -83,6 +84,38 @@ async function invoke(routes, path, opts = {}) {
   res.end = body => { res.body = JSON.parse(body) }
   await route.handler(req, res)
   return res
+}
+
+/**
+ * A live process that is NOT this one, for the cases where the machine-wide
+ * lock must be honored: the staleness rules only respect a holder whose pid is
+ * alive, so a fake pid would be stolen and prove nothing.
+ * @param {import('node:test').TestContext} t - for cleanup.
+ * @returns {import('node:child_process').ChildProcess} the other "host".
+ */
+function foreignHost(t) {
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' })
+  t.after(() => { child.kill() })
+  return child
+}
+
+/**
+ * Store a usable snapshot of `version`, built from a throwaway healthy tree.
+ *
+ * A boot pass that ignores the machine-wide lock has something to restore, and
+ * that restore is the destructive step the lock tests exist to prevent.
+ * @param {string} snapshotsDir - the store to seed.
+ * @param {string} version - the version to snapshot.
+ * @returns {Promise<void>} resolves once the snapshot is listed as usable.
+ */
+async function seedSnapshot(snapshotsDir, version) {
+  const tree = mkdtempSync(join(tmpdir(), 'vu-p02-seed-'))
+  mkdirSync(join(tree, 'lib'), { recursive: true })
+  writeFileSync(join(tree, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version }))
+  writeFileSync(join(tree, 'lib', 'bin.js'), '// launcher')
+  const outcome = await createSnapshotAsync({ installDir: tree, snapshotsDir, version, now: () => 1 })
+  rmSync(tree, { recursive: true, force: true })
+  assert.equal(outcome.ok, true, `seed a snapshot of ${version}`)
 }
 
 test('apply mounts the full core family; notes stay off without a repo slug', (t) => {
@@ -376,8 +409,36 @@ test('a repair that restored nothing is not recorded as a successful one', async
     console.error = savedError
   }
   const history = JSON.parse(readFileSync(join(dataDir, 'history.json'), 'utf8'))
-  assert.equal(history.at(-1).restored, true, 'the pass is still recorded as a repair')
+  assert.equal(history.at(-1).repair, true, 'the pass is still recorded as a tree repair')
+  assert.equal(history.at(-1).restored, undefined, 'but it must not claim a snapshot restore it never performed')
   assert.equal(history.at(-1).result, 'failed', 'a repair that restored nothing did not succeed')
+})
+
+test('a pure litter sweep is recorded as a repair, never as a snapshot restore', async (t) => {
+  const { installDir, dataDir } = environment(t, '0.4.0')
+  // A healthy tree with one retirement old enough for the boot pass to reclaim,
+  // and no snapshot anywhere: the pass can only DELETE, so the audit trail must
+  // not describe it as a version transition.
+  mkdirSync(join(installDir, 'lib'), { recursive: true })
+  writeFileSync(join(installDir, 'lib', 'bin.js'), '// launcher')
+  const leftover = join(installDir, 'node_modules', '.foo-12345678')
+  mkdirSync(leftover, { recursive: true })
+  const at = Date.now() - 2 * RETIRED_MIN_AGE_MS
+  utimesSync(leftover, new Date(at), new Date(at))
+  utimesSync(join(installDir, 'node_modules'), new Date(at), new Date(at))
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+  assert.equal(existsSync(leftover), false, 'the pass reclaimed the litter')
+
+  const entry = JSON.parse(readFileSync(join(dataDir, 'history.json'), 'utf8')).at(-1)
+  assert.equal(entry.repair, true, 'the pass is recorded as a tree repair')
+  assert.equal(entry.removed, 1, 'and it says how much litter it reclaimed')
+  // The lie this replaces: every pass was recorded as `restored: true`, so one
+  // that copied nothing over the tree still rendered as "snapshot restore" — a
+  // version transition the trail never witnessed.
+  assert.equal(entry.restored, undefined, 'a sweep must not claim a snapshot restore')
 })
 
 test('a retired folder the boot sweep had to defer is reclaimed once it ages past the gate', async (t) => {
@@ -398,7 +459,14 @@ test('a retired folder the boot sweep had to defer is reclaimed once it ages pas
   mkdirSync(leftover, { recursive: true })
   const inside = 1500
   const at = Date.now() - (10 * 60 * 1000) + inside
+  // BOTH the retirement and the directory that holds it. A retirement is a
+  // rename, and a rename moves only the PARENT's mtime — so the age gate reads
+  // the parent as its freshness evidence. Back-dating the child alone would now
+  // (correctly) describe a folder retired this very instant, and the pass under
+  // test would wait out the entire gate instead of the 1.5 s this fixture is
+  // about. Order matters: creating the child bumped the parent's mtime.
   utimesSync(leftover, new Date(at), new Date(at))
+  utimesSync(join(installDir, 'node_modules'), new Date(at), new Date(at))
 
   const ctx = fakeCtx()
   apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
@@ -407,6 +475,92 @@ test('a retired folder the boot sweep had to defer is reclaimed once it ages pas
   // The follow-up waits out the rest of the gate and then sweeps.
   await new Promise(resolve => { setTimeout(resolve, inside + 1500) })
   assert.equal(existsSync(leftover), false, 'the deferred pass reclaimed the leftover')
+})
+
+test('a boot repair yields to another host mid-install instead of rebuilding under it', async (t) => {
+  const { installDir, dataDir } = environment(t, '0.4.0')
+  const snapshotsDir = join(dataDir, 'snapshots')
+  await seedSnapshot(snapshotsDir, '0.3.0')
+  // The live tree is in the shape another host's npm leaves behind mid-reify:
+  // the package folder renamed aside, so the manifest is unreadable. A boot pass
+  // that ignores the lock reads that as "damaged tree + usable snapshot" and
+  // copies the snapshot over a tree npm is still writing.
+  rmSync(join(installDir, 'package.json'))
+
+  const other = foreignHost(t)
+  const lockPath = join(dataDir, 'update.lock')
+  writeFileSync(lockPath, JSON.stringify({ pid: other.pid, at: Date.now(), token: 'foreign' }), 'utf8')
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+
+  assert.equal(existsSync(join(installDir, 'package.json')), false, 'the boot pass must not rebuild a tree another host is writing')
+  assert.equal(existsSync(join(snapshotsDir, '0.3.0', 'package.json')), true, 'and the snapshot stays in the store, unspent')
+  assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).token, 'foreign', 'the foreign lock is neither stolen nor released')
+  // Deferring must not mean hiding: the damage still reaches the panel, which is
+  // what tells the user the tree is in another host's hands.
+  const status = await invoke(ctx.registered, VERSION_API.status)
+  assert.equal(status.body.result.tree.manifestOk, false)
+  assert.equal(status.body.result.tree.healthy, false)
+})
+
+test('a boot repair that deferred to another host is retried, not dropped', async (t) => {
+  const { installDir, dataDir } = environment(t, '0.4.0')
+  const snapshotsDir = join(dataDir, 'snapshots')
+  await seedSnapshot(snapshotsDir, '0.3.0')
+  rmSync(join(installDir, 'package.json'))
+
+  const other = foreignHost(t)
+  const lockPath = join(dataDir, 'update.lock')
+  writeFileSync(lockPath, JSON.stringify({ pid: other.pid, at: Date.now(), token: 'foreign' }), 'utf8')
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+  assert.equal(existsSync(join(installDir, 'package.json')), false, 'nothing happens while the other host holds the tree')
+
+  // The other host finishes. The deferred retry is armed at REPAIR_DELAY_MS
+  // (RELEASE_GRACE_MS + 1000 = 6 s), so waiting past it is the whole assertion:
+  // yielding is only correct if the pass comes back.
+  other.kill()
+  await new Promise(resolve => { setTimeout(resolve, 7000) })
+  assert.equal(
+    JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version,
+    '0.3.0',
+    'the deferred pass ran once the tree was free',
+  )
+  assert.equal(existsSync(lockPath), false, 'and it gave the machine-wide lock back')
+  // The distinction the trail has to keep: this pass really did copy a snapshot
+  // over the tree, so it says so — while a pass that only deleted litter does
+  // not (see the pure-sweep case above).
+  const entry = JSON.parse(readFileSync(join(dataDir, 'history.json'), 'utf8')).at(-1)
+  assert.equal(entry.repair, true, 'a deferred pass is still recorded as a tree repair')
+  assert.equal(entry.restored, true, 'and a pass that really restored the snapshot says so')
+})
+
+test('a boot repair holds the machine-wide lock and gives it back', async (t) => {
+  const { installDir, dataDir } = environment(t, '0.4.0')
+  // A healthy tree with one retirement old enough for the boot pass to reclaim.
+  // The pass only runs at all when there is litter or a damaged manifest.
+  mkdirSync(join(installDir, 'lib'), { recursive: true })
+  writeFileSync(join(installDir, 'lib', 'bin.js'), '// launcher')
+  const leftover = join(installDir, 'node_modules', '.foo-12345678')
+  mkdirSync(leftover, { recursive: true })
+  const at = Date.now() - 2 * RETIRED_MIN_AGE_MS
+  utimesSync(leftover, new Date(at), new Date(at))
+  utimesSync(join(installDir, 'node_modules'), new Date(at), new Date(at))
+
+  const lockPath = join(dataDir, 'update.lock')
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+
+  assert.equal(existsSync(leftover), false, 'the boot pass still reclaims old litter')
+  // The pass takes the machine-wide lock now, which is what makes it safe against
+  // a second host. Failing to hand it back would refuse every later install for
+  // the lock's whole staleness window — an hour of "another host holds the lock".
+  assert.equal(existsSync(lockPath), false, 'the boot repair released the machine-wide lock')
 })
 
 test('a snapshot delete unlinks that version, leaves the tree alone, and writes no history', async (t) => {
