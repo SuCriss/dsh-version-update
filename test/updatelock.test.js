@@ -5,9 +5,9 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { acquireUpdateLock, readLockHolder } from '../lib/updatelock.js'
 import { verifyInstalled } from '../lib/updater.js'
 
@@ -98,6 +98,51 @@ test('a stolen lock survives the release of the holder it was stolen from', () =
   writeFileSync(path, JSON.stringify({ pid: 43, at: Date.now(), token: 'foreign' }), 'utf8')
   second.release()
   assert.equal(readLockHolder(readFileSync(path, 'utf8'))?.pid, 43, 'never removes another host\'s lock')
+})
+
+test('a steal removes only the record it judged stale, never one that replaced it', () => {
+  const path = lockPath()
+  // A genuinely stale record: a dead pid, well past the ceiling.
+  writeFileSync(path, JSON.stringify({ pid: 999999, at: 0, token: 'stale' }), 'utf8')
+  let swapped = false
+  const result = acquireUpdateLock({
+    lockPath: path,
+    pid: 1,
+    now: () => 2 * 60 * 60 * 1000,
+    maxAgeMs: 60 * 1000,
+    // The interleaving two waiters produce: between the staleness judgement and
+    // the removal, the first waiter replaces the stale record with its own live
+    // one. A bare `rmSync` deletes that new lock — and BOTH hosts then install
+    // into the same global tree.
+    isAlive: () => {
+      if (!swapped) {
+        swapped = true
+        writeFileSync(path, JSON.stringify({ pid: process.pid, at: 2 * 60 * 60 * 1000, token: 'fresh' }), 'utf8')
+      }
+      return false
+    },
+  })
+  assert.equal(swapped, true, 'the seam really ran on the staleness path')
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).token, 'fresh', 'the live record that replaced the stale one survives')
+  assert.equal(result.ok, false, 'and the acquisition refuses rather than take a lock somebody holds')
+  assert.equal(result.holder?.pid, process.pid, 'the refusal names the holder it actually found')
+})
+
+test('an acquisition publishes a complete record and leaves no working file behind', () => {
+  const path = lockPath()
+  const first = acquireUpdateLock({ lockPath: path, pid: 7, now: () => 1000 })
+  assert.equal(first.ok, true)
+  // The record is published by hard-linking an already-written temp file into
+  // place, so the lock path is never observable as an EMPTY file — and an empty
+  // lock is what every reader treats as corrupt and steals.
+  const record = JSON.parse(readFileSync(path, 'utf8'))
+  assert.equal(record.pid, 7)
+  assert.ok(record.token, 'the record is complete from the moment the path exists')
+  // The temp file it was linked from is gone with it: the lock directory holds
+  // the lock and nothing else.
+  assert.deepEqual(readdirSync(dirname(path)), ['update.lock'])
+  first.release()
+  assert.throws(() => readFileSync(path, 'utf8'), { code: 'ENOENT' })
 })
 
 test('each acquisition writes a record only its own release can remove', () => {
