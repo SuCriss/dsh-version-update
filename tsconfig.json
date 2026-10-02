@@ -28,20 +28,31 @@
   // likewise excluded — they are built almost entirely from deliberately partial
   // fakes, and typing those to satisfy the DOM lib would obscure what each one
   // is asserting.
+  //
+  // This array IS the gate: every other host-half module is listed, and one that
+  // is missing is simply never checked. Five of them had drifted out of the list
+  // (opevents, preflight, restart-log, snapshot-inventory, updatelock) while
+  // still carrying the JSDoc that only this config turns into a constraint, so a
+  // new lib/*.js belongs here the moment it exists.
   "include": [
     "lib/core.js",
     "lib/history.js",
     "lib/index.js",
     "lib/loopback.js",
+    "lib/opevents.js",
     "lib/policy.js",
+    "lib/preflight.js",
     "lib/protocol.js",
     "lib/relaunch.js",
+    "lib/restart-log.js",
     "lib/restarter.js",
     "lib/routes.js",
     "lib/scheduler.js",
     "lib/snapshot.js",
+    "lib/snapshot-inventory.js",
     "lib/tree-health.js",
     "lib/updater.js",
+    "lib/updatelock.js",
     "types"
   ],
   "exclude": ["node_modules"]
