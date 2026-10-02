@@ -3,6 +3,37 @@
 All notable changes to this plugin. Versions follow semver over the plugin's own
 surface: its entry config, its route family, and the settings page it renders.
 
+## [1.4.4] - 2026-10-02
+
+### Fixed
+
+- **A refused restore no longer blames a host that does not exist.** Both lock
+  refusals attributed any live holder to "another host", and the holder can be
+  THIS process: a hard-ceiling kill settles the task — so the panel's "an install
+  is running" guard stops firing — while deliberately keeping the machine-wide
+  lock until the killed npm has really exited, and a disposed fiber leaves its
+  orphan holding that lock the same way. A restore, or an install, refused in that
+  window told the user to go looking for a second host. The two cases are now
+  named separately, and both messages keep the phrase the panel keys on.
+- **The post-failure repair timer no longer holds a quitting host open.** It was
+  the one timer in the plugin that was never `unref()`'d, and a contended tree
+  RE-ARMS it — so the worst case was not one delay but the whole retry budget,
+  roughly 24 s of a process the user had already asked to go away. What it defers
+  is best-effort maintenance, and the next boot's pass covers whatever it did not.
+  Every timer in the plugin is now `unref()`'d.
+
+### Changed
+
+- **Every host-half module is back under the type checker.** Five of them —
+  `opevents`, `preflight`, `restart-log`, `snapshot-inventory` and `updatelock` —
+  had drifted out of `tsconfig.json`'s `include` while still carrying the JSDoc
+  that only that config turns into a real constraint, so nothing was checking
+  them: a deliberate type error planted in one produced six diagnostics once
+  listed, and none at all before. That array IS the gate, and a new `lib/*.js`
+  belongs in it the moment it exists.
+- A stray comment opener in `lib/relaunch.js`, which had swallowed the JSDoc of
+  the restart-log helper, was removed. Comment-only.
+
 ## [1.4.3] - 2026-10-02
 
 ### Fixed
