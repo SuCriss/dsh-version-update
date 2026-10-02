@@ -480,7 +480,13 @@ test('a replacement waits for the orphan lock to release on close', async (t) =>
   const spawnB = spawnStub()
   const second = createUpdater({ spawnImpl: spawnB, npmCli: '/n', lockPath })
   t.after(() => second.dispose())
-  assert.throws(() => second.start('1.1.0'), /machine-wide update lock/)
+  // The holder is THIS process's own orphaned npm, and the refusal has to say
+  // so: "another install holds the lock" would send the user hunting for a
+  // second host that is not there.
+  assert.throws(
+    () => second.start('1.1.0'),
+    /this host's own previous install still holds the machine-wide update lock/,
+  )
   assert.equal(spawnB.calls.length, 0)
 
   orphan.emit('close', 0)

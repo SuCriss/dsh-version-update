@@ -634,10 +634,35 @@ test('a restore yields to another host that holds the machine-wide lock', async 
   apply(ctx, { dataDir, lockPath })
   const res = await invoke(ctx.registered, VERSION_API.restore, { method: 'POST', body: { version: '0.4.0' } })
   assert.equal(res.status, 409)
-  assert.match(res.body.error, /machine-wide update lock/)
+  assert.match(res.body.error, /another host holds the machine-wide update lock/)
+  assert.doesNotMatch(res.body.error, /this host's own/, 'a foreign holder must not be reported as our own')
   assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.9.0', 'the other host\'s tree is untouched')
   // The refusal left the foreign lock exactly where it was.
   assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).token, 'foreign')
+})
+
+test('a restore refused by this host\'s own lock does not blame another host', async (t) => {
+  const { installDir, dataDir } = environment(t)
+  const snapshotsDir = join(dataDir, 'snapshots')
+  await seedSnapshot(snapshotsDir, '0.3.0')
+  writeFileSync(join(installDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.9.0' }))
+
+  // The lock is held by OUR OWN pid — the state a hard-ceiling kill leaves
+  // behind. The task is already terminal by then, so the route's "an install is
+  // running" guard no longer fires and the machine-wide lock is the only thing
+  // still saying no. Telling the user another host holds it sends them hunting
+  // for a process that does not exist.
+  const lockPath = join(dataDir, 'update.lock')
+  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now(), token: 'ours' }), 'utf8')
+
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+  const res = await invoke(ctx.registered, VERSION_API.restore, { method: 'POST', body: { version: '0.3.0' } })
+  assert.equal(res.status, 409)
+  assert.match(res.body.error, /this host's own previous install still holds the machine-wide update lock/)
+  assert.doesNotMatch(res.body.error, /another host/, 'our own lock is not another host\'s')
+  assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.9.0', 'the live tree is untouched')
 })
 
 test('a restore keeps the version it replaces, so the rollback can itself be rolled back', async (t) => {
