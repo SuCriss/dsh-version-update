@@ -665,6 +665,30 @@ test('a restore refused by this host\'s own lock does not blame another host', a
   assert.equal(JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')).version, '0.9.0', 'the live tree is untouched')
 })
 
+test('the post-failure repair timer does not keep the event loop alive', async (t) => {
+  const { dataDir } = environment(t, '0.4.0')
+  // A snapshots path blocked by a regular file makes the pre-install snapshot
+  // fail, which `requireSnapshot` turns into a FatalPreparationError: the task
+  // settles FAILED without npm ever being spawned, and that failure is what
+  // schedules the tree repair — the timer under test.
+  writeFileSync(join(dataDir, 'snapshots'), 'blocked')
+  const ctx = fakeCtx()
+  apply(ctx, { dataDir, lockPath: join(dataDir, 'update.lock') })
+  t.after(() => { for (const dispose of ctx.effects) dispose?.() })
+
+  const count = () => process.getActiveResourcesInfo().filter(kind => kind === 'Timeout').length
+  const before = count()
+  const res = await invoke(ctx.registered, VERSION_API.update, { method: 'POST', body: { version: '9.9.9' } })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  // Let the pipeline reach its pre-spawn failure and arm the repair.
+  await new Promise(resolve => setTimeout(resolve, 500))
+  const after = count()
+  // A timer that is `unref()`'d is not a resource that keeps the event loop
+  // alive, so the repair's pending pass must not show up here — a ref'd one adds
+  // exactly one, and would hold a quitting host open for the whole retry budget.
+  assert.ok(after <= before, `the repair timer must not keep the loop alive (before=${String(before)}, after=${String(after)})`)
+})
+
 test('a restore keeps the version it replaces, so the rollback can itself be rolled back', async (t) => {
   const { installDir, dataDir } = environment(t)
   const snapshotsDir = join(dataDir, 'snapshots')
